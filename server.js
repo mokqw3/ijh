@@ -9,11 +9,15 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- CORS Configuration ---
-app.use(cors());
+// This allows your frontend to make requests to this server.
+const allowedOrigin = process.env.ALLOWED_ORIGIN || '*'; // Use '*' for development if needed, but be specific in production
+const corsOptions = {
+  origin: allowedOrigin
+};
+app.use(cors(corsOptions));
+
 
 // --- PATHS FOR DATA PERSISTENCE ---
-// Render provides a persistent disk at the path specified in your service settings.
-// We default to the local directory if not running on Render.
 const DATA_DIR = process.env.RENDER_DISK_PATH || __dirname;
 const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json');
 const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json');
@@ -25,6 +29,24 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 
 app.use(express.json());
+
+// --- API Key Middleware ---
+// This middleware protects your endpoints.
+const requireApiKey = (req, res, next) => {
+  const apiKey = req.get('X-API-Key');
+  const serverApiKey = process.env.API_KEY;
+
+  if (!serverApiKey) {
+      console.error("API_KEY environment variable is not set on the server.");
+      return res.status(500).json({ error: 'Server configuration error.' });
+  }
+
+  if (!apiKey || apiKey !== serverApiKey) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid or missing API Key' });
+  }
+  next();
+};
+
 
 // --- APPLICATION STATE MANAGEMENT ---
 let appState = {
@@ -42,7 +64,6 @@ function loadAppState() {
             console.log("Application state loaded successfully.");
         } catch (error) {
             console.error("Could not load app state, starting fresh.", error);
-            // Initialize with empty state if file is corrupt
             appState = { historyData: [], lastProcessedPeriodId: null, currentSystemLosses: 0, nextPrediction: null };
         }
     }
@@ -94,7 +115,7 @@ async function mainCycle() {
                 console.log(`Stored new game result for period ${latestGameResult.issueNumber}`);
             }
             
-            if (latestGameResult.issueNumber !== appState.lastProcessedPeriodId) {
+            if (String(latestGameResult.issueNumber) !== appState.lastProcessedPeriodId) {
                 console.log(`New period detected. Old: ${appState.lastProcessedPeriodId}, New: ${latestGameResult.issueNumber}. Running prediction cycle.`);
                 
                 const result = await processPredictionCycle(latestGameResult, appState.historyData, appState.lastProcessedPeriodId);
@@ -125,9 +146,13 @@ async function mainCycle() {
 setInterval(mainCycle, 30000);
 
 // --- API ENDPOINTS ---
-app.post('/predict', (req, res) => {
-    if (appState.nextPrediction) {
+
+// FIX: Changed to GET and now returns the period number with the prediction.
+app.get('/predict', requireApiKey, (req, res) => {
+    if (appState.nextPrediction && appState.lastProcessedPeriodId) {
+        const nextPeriod = (BigInt(appState.lastProcessedPeriodId) + 1n).toString();
         res.json({
+            period: nextPeriod,
             finalDecision: appState.nextPrediction.prediction,
             finalConfidence: appState.nextPrediction.confidence,
         });
@@ -136,7 +161,35 @@ app.post('/predict', (req, res) => {
     }
 });
 
-app.get('/game-data', (req, res) => {
+// NEW: Added this endpoint to allow the frontend to check for results.
+app.get('/get-result', requireApiKey, (req, res) => {
+    const { period } = req.query;
+
+    if (!period) {
+        return res.status(400).json({ error: 'Period query parameter is required.' });
+    }
+
+    if (!fs.existsSync(GAME_DATA_PATH)) {
+        return res.status(404).json({ error: 'Game data file not found.' });
+    }
+
+    try {
+        const gameDataStore = JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8'));
+        const result = gameDataStore.history.find(item => String(item.issueNumber) === String(period));
+
+        if (result) {
+            res.json({ period: result.issueNumber, number: result.number });
+        } else {
+            res.status(404).json({ error: `Result for period ${period} not found.` });
+        }
+    } catch (error) {
+        console.error(`Error in /get-result:`, error);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+
+app.get('/game-data', requireApiKey, (req, res) => {
     if (fs.existsSync(GAME_DATA_PATH)) {
         res.sendFile(GAME_DATA_PATH);
     } else {
