@@ -1,0 +1,12 @@
+# Node.js modules
+node_modules
+
+# Environment file with secrets
+.env
+
+# Data files that will be stored on the persistent disk
+gameData.json
+appState.json
+
+# NPM debug logs
+npm-debug.log*
