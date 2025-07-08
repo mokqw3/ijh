@@ -1638,4 +1638,5 @@ if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
         // Make stateful components accessible for external management if needed
         signalPerformance,
         REGIME_SIGNAL_PROFILES
-    }
+    };
+}
