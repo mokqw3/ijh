@@ -6,16 +6,16 @@ const { ultraAIPredict } = require('./predictionLogic.js');
 const admin = require('firebase-admin');
 
 // --- Firebase Admin SDK Initialization ---
-// IMPORTANT: You must create a service account and set the GOOGLE_APPLICATION_CREDENTIALS
-// environment variable on Render for this to work.
 try {
+    // FIX: Explicitly providing the projectId to prevent auto-detection issues.
     admin.initializeApp({
         credential: admin.credential.applicationDefault(),
+        projectId: process.env.GCLOUD_PROJECT, // This line directly uses the environment variable
         databaseURL: `https://${process.env.GCLOUD_PROJECT}.firebaseio.com`
     });
     console.log("Firebase Admin SDK initialized successfully.");
 } catch (error) {
-    console.error("FATAL: Firebase Admin SDK initialization failed. Ensure GOOGLE_APPLICATION_CREDENTIALS is set correctly.", error);
+    console.error("FATAL: Firebase Admin SDK initialization failed. Ensure GOOGLE_APPLICATION_CREDENTIALS and GCLOUD_PROJECT are set correctly.", error);
     process.exit(1); // Exit if Firebase can't be initialized
 }
 
@@ -47,12 +47,17 @@ const requireApiKey = (req, res, next) => {
   next();
 };
 
-// --- State Management (using Firestore) ---
-const stateRef = db.collection('app-state').doc('main');
-app.locals.nextPrediction = null; 
+// --- PATHS & STATE MANAGEMENT ---
+const DATA_DIR = process.env.RENDER_DISK_PATH || __dirname;
+const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json'); // This is now a fallback/legacy path
+const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json'); // This is now a fallback/legacy path
+
+let sharedStats = {}; // This will hold the persistent state for the prediction engine
+app.locals.nextPrediction = null; // Store nextPrediction on the app object
 
 async function loadState() {
     try {
+        const stateRef = db.collection('app-state').doc('main');
         const doc = await stateRef.get();
         if (doc.exists) {
             app.locals.sharedStats = doc.data();
@@ -69,6 +74,7 @@ async function loadState() {
 
 async function saveState() {
     try {
+        const stateRef = db.collection('app-state').doc('main');
         await stateRef.set(app.locals.sharedStats);
     } catch (error) {
         console.error("Failed to save prediction state to Firestore:", error);
@@ -110,7 +116,6 @@ async function mainCycle() {
             await gameResultRef.set(latestGameResult);
             console.log(`Stored new game result for period ${periodId}`);
 
-            // Fetch the last 200 records for prediction
             const historySnapshot = await db.collection('game-history').orderBy('issueNumber', 'desc').limit(200).get();
             const history = historySnapshot.docs.map(doc => doc.data());
             
@@ -130,7 +135,6 @@ async function mainCycle() {
             
             await saveState();
 
-            // Prune old data to keep collection size manageable
             const countSnapshot = await db.collection('game-history').count().get();
             const count = countSnapshot.data().count;
             if (count > 50000) {
