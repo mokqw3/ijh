@@ -39,6 +39,7 @@ const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json');
 const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json');
 
 let sharedStats = {}; // This will hold the persistent state for the prediction engine
+app.locals.nextPrediction = null; // FIX: Store nextPrediction on the app object
 
 function loadState() {
     if (fs.existsSync(APP_STATE_PATH)) {
@@ -117,7 +118,7 @@ async function mainCycle() {
             const prediction = ultraAIPredict(gameDataStore.history, sharedStats);
             
             // Store the new prediction in our server's state
-            appState.nextPrediction = {
+            app.locals.nextPrediction = { // FIX: Store on app.locals
                 period: nextPeriod,
                 ...prediction
             };
@@ -133,12 +134,12 @@ setInterval(mainCycle, 30000);
 
 // --- API ENDPOINTS ---
 app.get('/predict', requireApiKey, (req, res) => {
-    if (appState.nextPrediction) {
+    if (app.locals.nextPrediction) { // FIX: Read from app.locals
         res.json({
-            period: appState.nextPrediction.period,
-            finalDecision: appState.nextPrediction.finalDecision,
+            period: app.locals.nextPrediction.period,
+            finalDecision: app.locals.nextPrediction.finalDecision,
             // Convert confidence from 0-1 range to 0-100 for the frontend
-            finalConfidence: appState.nextPrediction.finalConfidence * 100, 
+            finalConfidence: app.locals.nextPrediction.finalConfidence * 100, 
         });
     } else {
         res.status(404).json({ error: 'Prediction not available yet. Please wait for the next cycle.' });
