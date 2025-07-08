@@ -1,151 +1,48 @@
-// This is the full, corrected prediction logic from your file.
-const fetch = require('node-fetch');
-
-// --- Global State & Configuration ---
-const STATE_STORAGE_KEY = 'combined_prediction_engine_state_v2';
-
-let signalPerformance = {};
-let REGIME_SIGNAL_PROFILES = {};
-let driftDetector = {
-    ewma: 0.5,
-    lambda: 0.15,
-    warningThreshold: 0.07,
-    driftThreshold: 0.12,
-    baselineError: 0.5,
-    recentErrors: []
-};
-let consecutiveHighConfLosses = 0;
-let reflexiveCorrectionActive = 0;
-let engineMode = "NORMAL";
-let qTable = {};
-let GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE = 0.5;
-let heuristicPerformance = {};
-let systemConsecutiveLosses = 0;
-
-// --- Constants for Dynamic Weighting and Learning ---
-const PERFORMANCE_WINDOW = 30;
-const MIN_OBSERVATIONS_FOR_ADJUST = 8;
-const MAX_WEIGHT_FACTOR = 2.0;
-const MIN_WEIGHT_FACTOR = 0.05;
-const MAX_ALPHA_FACTOR = 1.7;
-const MIN_ALPHA_FACTOR = 0.3;
-const MIN_ABSOLUTE_WEIGHT = 0.0003;
-const ALPHA_UPDATE_RATE = 0.06;
-const PROBATION_THRESHOLD_ACCURACY = 0.40;
-const PROBATION_MIN_OBSERVATIONS = 15;
-const PROBATION_WEIGHT_CAP = 0.10;
-const REGIME_ACCURACY_WINDOW = 35;
-const REGIME_LEARNING_RATE_BASE = 0.028;
-const Q_LEARNING_RATE = 0.1;
-const Q_DISCOUNT_FACTOR = 0.9;
-const Q_REWARD_WIN = 1;
-const Q_REWARD_LOSS = -1;
-
-const defaultHeuristicPerformance = {
-    'Pattern_LHT': { correct: 0, total: 0 },
-    'Frequency_LHT': { correct: 0, total: 0 },
-    'Recovery_LHT': { correct: 0, total: 0 },
-    'Balance_LHT': { correct: 0, total: 0 },
-    'Trend_LHT': { correct: 0, total: 0 },
-    'Oscillation_LHT': { correct: 0, total: 0 },
-    'MicroTrend_LHT': { correct: 0, total: 0 },
-    'Deviation_LHT': { correct: 0, total: 0 },
-    'Simple_LHT': { correct: 0, total: 0 },
-    'ATS-Numerology_TX': { correct: 0, total: 0 },
-    'ATS-ARIMA_TX': { correct: 0, total: 0 },
-    'ATS-LSTM-Pattern_TX': { correct: 0, total: 0 },
-    'ATS-Q-Learning_TX': { correct: 0, total: 0 },
-    'Ichimoku_TX': { correct: 0, total: 0 },
-    'RSI_TX': { correct: 0, total: 0 },
-    'Stochastic_TX': { correct: 0, total: 0 },
-    'Vol-Trend-Fusion_TX': { correct: 0, total: 0 }
-};
-
-// --- State Persistence Functions ---
-function savePredictionEngineState() {
-    try {
-        const state = {
-            signalPerformance,
-            REGIME_SIGNAL_PROFILES,
-            driftDetector,
-            consecutiveHighConfLosses,
-            reflexiveCorrectionActive,
-            engineMode,
-            qTable,
-            GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE,
-            heuristicPerformance,
-            systemConsecutiveLosses
-        };
-        // In a server environment, this would write to a file, not localStorage
-        console.log("[STATE] Prediction engine state updated in memory.");
-    } catch (error) {
-        console.error(`[STATE] Error saving state: ${error.message}`);
-    }
-}
-
-function loadPredictionEngineState() {
-    try {
-        // In a server environment, we'd load from a file. For now, we initialize.
-        console.log("[STATE] Initializing new state for server instance.");
-        initializeRegimeProfiles();
-        initializeHeuristicPerformance();
-    } catch (error) {
-        console.error(`[STATE] Error loading state. Initializing new state.`);
-        initializeRegimeProfiles();
-        initializeHeuristicPerformance();
-    }
-}
-
-function initializeRegimeProfiles() {
-    REGIME_SIGNAL_PROFILES = {
-        "TREND_STRONG_LOW_VOL": { baseWeightMultiplier: 1.40, activeSignalTypes: ['trend', 'momentum', 'ichimoku', 'volBreak', 'leadLag', 'stateSpace', 'fusion', 'ats', 'pattern', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 1.40, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "TREND_STRONG_MED_VOL": { baseWeightMultiplier: 1.30, activeSignalTypes: ['trend', 'momentum', 'ichimoku', 'pattern', 'leadLag', 'stateSpace', 'fusion', 'ats', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 1.30, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "TREND_STRONG_HIGH_VOL": { baseWeightMultiplier: 0.80, activeSignalTypes: ['trend', 'ichimoku', 'entropy', 'volPersist', 'zScore', 'fusion', 'ats', 'pattern', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 0.80, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "TREND_MOD_LOW_VOL": { baseWeightMultiplier: 1.25, activeSignalTypes: ['trend', 'momentum', 'ichimoku', 'pattern', 'volBreak', 'leadLag', 'stateSpace', 'ats', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 1.25, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "TREND_MOD_MED_VOL": { baseWeightMultiplier: 1.20, activeSignalTypes: ['trend', 'momentum', 'ichimoku', 'pattern', 'rsi', 'leadLag', 'bayesian', 'fusion', 'ats', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 1.20, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "TREND_MOD_HIGH_VOL": { baseWeightMultiplier: 0.85, activeSignalTypes: ['trend', 'ichimoku', 'meanRev', 'stochastic', 'volPersist', 'zScore', 'ats', 'pattern', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 0.85, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "RANGE_LOW_VOL": { baseWeightMultiplier: 1.20, activeSignalTypes: ['meanRev', 'pattern', 'volBreak', 'stochastic', 'harmonic', 'fractalDim', 'zScore', 'bayesian', 'fusion', 'ats', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 1.20, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "RANGE_MED_VOL": { baseWeightMultiplier: 1.10, activeSignalTypes: ['meanRev', 'pattern', 'stochastic', 'rsi', 'bollinger', 'harmonic', 'zScore', 'ats', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 1.10, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "RANGE_HIGH_VOL": { baseWeightMultiplier: 0.75, activeSignalTypes: ['meanRev', 'entropy', 'bollinger', 'vwapDev', 'volPersist', 'zScore', 'fusion', 'ats', 'pattern', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 0.75, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "WEAK_HIGH_VOL": { baseWeightMultiplier: 0.70, activeSignalTypes: ['meanRev', 'entropy', 'stochastic', 'volPersist', 'fractalDim', 'zScore', 'ats', 'pattern', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 0.70, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "WEAK_MED_VOL": { baseWeightMultiplier: 0.80, activeSignalTypes: ['momentum', 'meanRev', 'pattern', 'rsi', 'fractalDim', 'bayesian', 'ats', 'frequency', 'balance', 'oscillation', 'microTrend', 'deviation'], contextualAggression: 0.80, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "WEAK_LOW_VOL": { baseWeightMultiplier: 0.90, activeSignalTypes: ['all'], contextualAggression: 0.90, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
-        "DEFAULT": { baseWeightMultiplier: 1.0, activeSignalTypes: ['all'], contextualAggression: 1.0, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 }
-    };
-}
-
-function initializeHeuristicPerformance() {
-    if (!heuristicPerformance || Object.keys(heuristicPerformance).length === 0) {
-        heuristicPerformance = {};
-    }
-    for (const key in defaultHeuristicPerformance) {
-        if (defaultHeuristicPerformance.hasOwnProperty(key) && !heuristicPerformance.hasOwnProperty(key)) {
-            heuristicPerformance[key] = { ...defaultHeuristicPerformance[key] };
-        }
-    }
-}
+// predictionLogic.js - Quantum AI Supercore Engine
+// Version: 44.2.0 - Data Sanitization Fix
+// Changelog v44.2.0:
+// - **CRITICAL FIX**: Implemented a new `sanitizeForFirebase` helper function that recursively traverses the final output object and converts any `undefined` properties to `null`.
+// - **REFINED: Output**: The main `ultraAIPredict` function now uses this sanitizer on its return object, guaranteeing that no `undefined` values are ever passed to the database, which resolves the `set failed: value argument contains undefined` error.
+// - **Version Bump**: Incremented to v44.2.0 to reflect this critical data validation fix.
 
 // --- Helper Functions ---
-function getBigSmallType(number) {
-    if (number === undefined || number === null || isNaN(number)) return null;
+
+/**
+ * **NEW in v44.2.0: Firebase Sanitizer**
+ * Recursively traverses an object or array and converts `undefined` values to `null`.
+ * @param {*} obj The input object or value to sanitize.
+ * @returns {*} The sanitized object or value.
+ */
+function sanitizeForFirebase(obj) {
+    if (obj === undefined) {
+        return null;
+    }
+    if (obj === null || typeof obj !== 'object') {
+        return obj;
+    }
+    if (Array.isArray(obj)) {
+        return obj.map(item => sanitizeForFirebase(item));
+    }
+    const sanitizedObj = {};
+    for (const key in obj) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
+            const value = obj[key];
+            // Recursively sanitize and ensure no undefined values are assigned
+            sanitizedObj[key] = sanitizeForFirebase(value);
+        }
+    }
+    return sanitizedObj;
+}
+
+function getBigSmallFromNumber(number) {
+    if (number === undefined || number === null) return null;
     const num = parseInt(number);
-    if (num >= 0 && num <= 4) return 'SMALL';
-    if (num >= 5 && num <= 9) return 'BIG';
-    return null;
+    if (isNaN(num)) return null;
+    return num >= 0 && num <= 4 ? 'SMALL' : num >= 5 && num <= 9 ? 'BIG' : null;
 }
 
 function getOppositeOutcome(prediction) {
     return prediction === "BIG" ? "SMALL" : prediction === "SMALL" ? "BIG" : null;
-}
-
-function mulberry32(seed) {
-    seed = seed | 0;
-    return function() {
-        let t = seed += 0x6D2B79F5;
-        t = Math.imul(t ^ t >>> 15, t | 1);
-        t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-        return ((t ^ t >>> 14) >>> 0) / 4294967296;
-    }
 }
 
 function calculateSMA(data, period) {
@@ -159,8 +56,16 @@ function calculateEMA(data, period) {
     if (!Array.isArray(data) || data.length < period || period <= 0) return null;
     const k = 2 / (period + 1);
     const chronologicalData = data.slice().reverse();
-    let ema = calculateSMA(chronologicalData.slice(0, period), period);
+
+    const initialSliceForSma = chronologicalData.slice(0, period);
+    if (initialSliceForSma.length < period) return null;
+
+    let ema = calculateSMA(initialSliceForSma.slice().reverse(), period);
+    if (ema === null && initialSliceForSma.length > 0) {
+        ema = initialSliceForSma.reduce((a, b) => a + b, 0) / initialSliceForSma.length;
+    }
     if (ema === null) return null;
+
     for (let i = period; i < chronologicalData.length; i++) {
         ema = (chronologicalData[i] * k) + (ema * (1 - k));
     }
@@ -176,18 +81,39 @@ function calculateStdDev(data, period) {
     return Math.sqrt(variance);
 }
 
+function calculateVWAP(data, period) {
+    if (!Array.isArray(data) || data.length < period || period <= 0) return null;
+    const relevantData = data.slice(0, period);
+    let totalPriceVolume = 0;
+    let totalVolume = 0;
+    for (const entry of relevantData) {
+        const price = parseFloat(entry.actualNumber);
+        const volume = parseFloat(entry.volume || 1);
+        if (!isNaN(price) && !isNaN(volume) && volume > 0) {
+            totalPriceVolume += price * volume;
+            totalVolume += volume;
+        }
+    }
+    if (totalVolume === 0) return null;
+    return totalPriceVolume / totalVolume;
+}
+
+
 function calculateRSI(data, period) {
     if (period <= 0) return null;
     const chronologicalData = data.slice().reverse();
     if (!Array.isArray(chronologicalData) || chronologicalData.length < period + 1) return null;
     let gains = 0, losses = 0;
+
     for (let i = 1; i <= period; i++) {
         const change = chronologicalData[i] - chronologicalData[i - 1];
         if (change > 0) gains += change;
         else losses += Math.abs(change);
     }
+
     let avgGain = gains / period;
     let avgLoss = losses / period;
+
     for (let i = period + 1; i < chronologicalData.length; i++) {
         const change = chronologicalData[i] - chronologicalData[i - 1];
         let currentGain = change > 0 ? change : 0;
@@ -195,47 +121,90 @@ function calculateRSI(data, period) {
         avgGain = (avgGain * (period - 1) + currentGain) / period;
         avgLoss = (avgLoss * (period - 1) + currentLoss) / period;
     }
+
     if (avgLoss === 0) return 100;
     const rs = avgGain / avgLoss;
     return 100 - (100 / (1 + rs));
 }
 
-function calculateStochastic(data, period, kPeriod) {
-    const chronologicalData = data.slice().reverse();
-    if (!Array.isArray(chronologicalData) || chronologicalData.length < period) return null;
-    const kValues = [];
-    for (let i = period - 1; i < chronologicalData.length; i++) {
-        const slice = chronologicalData.slice(i - (period - 1), i + 1);
-        const highestHigh = Math.max(...slice);
-        const lowestLow = Math.min(...slice);
-        const currentClose = slice[slice.length - 1];
-        if (highestHigh === lowestLow) {
-            kValues.push(50);
-        } else {
-            kValues.push(((currentClose - lowestLow) / (highestHigh - lowestLow)) * 100);
-        }
-    }
-    if (kValues.length < kPeriod) return null;
-    const dSlice = kValues.slice(kValues.length - kPeriod);
-    const percentD = dSlice.reduce((a, b) => a + b, 0) / dSlice.length;
-    const percentK = kValues[kValues.length - 1];
-    return { k: percentK, d: percentD };
-}
-
 function getCurrentISTHour() {
     try {
         const now = new Date();
-        const istFormatter = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Kolkata', hour: 'numeric', hour12: false });
+        const istFormatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: 'Asia/Kolkata',
+            hour: 'numeric',
+            hour12: false
+        });
         const istHourString = istFormatter.formatToParts(now).find(part => part.type === 'hour').value;
         let hour = parseInt(istHourString, 10);
         if (hour === 24) hour = 0;
-        return { raw: hour, sin: Math.sin(hour / 24 * 2 * Math.PI), cos: Math.cos(hour / 24 * 2 * Math.PI) };
+
+        return {
+            raw: hour,
+            sin: Math.sin(hour / 24 * 2 * Math.PI),
+            cos: Math.cos(hour / 24 * 2 * Math.PI)
+        };
     } catch (error) {
         console.error("Error getting IST hour:", error);
         const hour = new Date().getHours();
-        return { raw: hour, sin: Math.sin(hour / 24 * 2 * Math.PI), cos: Math.cos(hour / 24 * 2 * Math.PI) };
+        return {
+             raw: hour,
+             sin: Math.sin(hour / 24 * 2 * Math.PI),
+             cos: Math.cos(hour / 24 * 2 * Math.PI)
+        };
     }
 }
+
+
+/**
+ * **FIXED in v44.1.0: Reverted to Simulation**
+ * Simulates fetching external data to prevent network errors.
+ * @returns {object} An object containing the combined factor and reasons.
+ */
+function getRealTimeExternalData() {
+    let combinedFactor = 1.0;
+    let reasons = [];
+
+    // 1. Weather Simulation
+    const weatherConditions = ["Clear", "Clouds", "Haze", "Smoke", "Rain", "Drizzle"];
+    const randomWeather = weatherConditions[Math.floor(Math.random() * weatherConditions.length)];
+    let weatherFactor = 1.0;
+    if (["Clear", "Clouds"].includes(randomWeather)) weatherFactor = 1.01;
+    else if (["Rain", "Drizzle"].includes(randomWeather)) weatherFactor = 0.99;
+    reasons.push(`Weather:${randomWeather}`);
+    combinedFactor *= weatherFactor;
+
+    // 2. Financial News Sentiment Simulation
+    const newsSentiments = ["Positive", "Neutral", "Negative"];
+    const randomNewsSentiment = newsSentiments[Math.floor(Math.random() * newsSentiments.length)];
+    let newsFactor = 1.0;
+    if (randomNewsSentiment === "Positive") newsFactor = 1.02;
+    else if (randomNewsSentiment === "Negative") newsFactor = 0.98;
+    reasons.push(`News:${randomNewsSentiment}`);
+    combinedFactor *= newsFactor;
+
+    // 3. Economic Event Simulation
+    const eventRiskLevels = ["None", "Low", "Medium", "High"];
+    const randomEventRisk = Math.random() < 0.9 ? eventRiskLevels[0] : eventRiskLevels[Math.floor(Math.random() * 3) + 1];
+    let eventFactor = 1.0;
+    if (randomEventRisk === "Medium") eventFactor = 0.95;
+    else if (randomEventRisk === "High") eventFactor = 0.85;
+    reasons.push(`EcoEvent:${randomEventRisk}`);
+    combinedFactor *= eventFactor;
+
+    // 4. Social Media Trend Simulation
+    const socialTrends = ["None", "Bullish", "Bearish", "Mixed"];
+    const randomSocialTrend = Math.random() < 0.8 ? socialTrends[0] : socialTrends[Math.floor(Math.random() * 3) + 1];
+    let socialFactor = 1.0;
+    if (randomSocialTrend === "Bullish") socialFactor = 1.03;
+    else if (randomSocialTrend === "Bearish") socialFactor = 0.97;
+    reasons.push(`Social:${randomSocialTrend}`);
+    combinedFactor *= socialFactor;
+
+    return { factor: combinedFactor, reason: `ExtData(${reasons.join(',')})` };
+}
+
+
 
 function getPrimeTimeSession(istHour) {
     if (istHour >= 10 && istHour < 12) return { session: "PRIME_MORNING", aggression: 1.25, confidence: 1.15 };
@@ -248,434 +217,22 @@ function getPrimeTimeSession(istHour) {
     return null;
 }
 
-const isPrime = num => {
-    for(let i = 2, s = Math.sqrt(num); i <= s; i++)
-        if(num % i === 0) return false;
-    return num > 1;
-}
 
-const fibonacci = num => {
-    if (num < 0) return 0;
-    let a = 0, b = 1;
-    while (b <= num) {
-        if (b === num) return 1;
-        let temp = a + b;
-        a = b;
-        b = temp;
-    }
-    return 0;
-};
-
-const calculateLyapunov = (digits) => {
-    if (digits.length < 2) return 0;
-    const mean = digits.reduce((a, b) => a + b, 0) / digits.length;
-    const variance = digits.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / digits.length;
-    return Math.sqrt(variance);
-};
-
-function calculateEntropyForSignal(outcomes, windowSize) {
-    if (!Array.isArray(outcomes) || outcomes.length < windowSize) return null;
-    const counts = { BIG: 0, SMALL: 0 };
-    outcomes.slice(0, windowSize).forEach(o => { if (o) counts[o] = (counts[o] || 0) + 1; });
-    let entropy = 0;
-    const totalValidOutcomes = counts.BIG + counts.SMALL;
-    if (totalValidOutcomes === 0) return 1;
-    for (let key in counts) {
-        if (counts[key] > 0) { const p = counts[key] / totalValidOutcomes; entropy -= p * Math.log2(p); }
-    }
-    return isNaN(entropy) ? 1 : entropy;
-}
-
-function applyBayesianAdjustment(bigScore, smallScore) {
-    const priorBig = 0.5, priorSmall = 0.5;
-    if ((bigScore + smallScore) === 0) return { big: 0.5, small: 0.5 };
-    const likelihoodBig = bigScore / (bigScore + smallScore);
-    const likelihoodSmall = 1 - likelihoodBig;
-    const posteriorBig = likelihoodBig * priorBig;
-    const posteriorSmall = likelihoodSmall * priorSmall;
-    const evidence = posteriorBig + posteriorSmall;
-    if (evidence === 0) return { big: 0.5, small: 0.5 };
-    return {
-        big: posteriorBig / evidence,
-        small: posteriorSmall / evidence
-    };
-}
-
-// --- LHT AI Heuristics ---
-function patternHeuristic(history) {
-    if (history.length < 3) return { prediction: null, confidence: 0 };
-    const types = history.slice(0, 5).map(h => getBigSmallType(Number(h.actual)));
-    let prediction = null;
-    let confidence = 0;
-    if (types.length >= 4 && types[0] === types[1] && types[1] === types[2] && types[2] === types[3]) {
-        prediction = types[0] === "BIG" ? "SMALL" : "BIG";
-        confidence = 90;
-    }
-    else if (types.length >= 3 && types[0] === types[1] && types[1] === types[2]) {
-        prediction = types[0] === "BIG" ? "SMALL" : "BIG";
-        confidence = 85;
-    }
-    else if (types.length >= 4 && types[0] !== types[1] && types[1] === types[2] && types[2] !== types[3]) {
-        prediction = types[0];
-        confidence = 70;
-    }
-    return { prediction, confidence };
-}
-
-function frequencyHeuristic(history) {
-    if (history.length < 10) return { prediction: null, confidence: 0 };
-    const analysisDepth = Math.min(history.length, 40);
-    const recentHistory = history.slice(0, analysisDepth);
-    const bigCount = recentHistory.filter(h => getBigSmallType(Number(h.actual)) === "BIG").length;
-    const smallCount = recentHistory.length - bigCount;
-    let prediction = null;
-    let confidence = 0;
-    const longTermBiasThreshold = 0.6;
-    if (bigCount / analysisDepth > longTermBiasThreshold) {
-        prediction = "SMALL";
-        confidence = 65 + (bigCount / analysisDepth - longTermBiasThreshold) * 100;
-    } else if (smallCount / analysisDepth > longTermBiasThreshold) {
-        prediction = "BIG";
-        confidence = 65 + (smallCount / analysisDepth - longTermBiasThreshold) * 100;
-    }
-    const shortTermHistory = history.slice(0, Math.min(history.length, 15));
-    const shortTermBigCount = shortTermHistory.filter(h => getBigSmallType(Number(h.actual)) === "BIG").length;
-    const shortTermSmallCount = shortTermHistory.length - shortTermBigCount;
-    const shortTermBiasThreshold = 0.7;
-    if (shortTermBigCount / shortTermHistory.length > shortTermBiasThreshold) {
-        if (prediction === "BIG") confidence = Math.max(confidence, 60);
-        else { prediction = "SMALL"; confidence = Math.max(confidence, 70); }
-    } else if (shortTermSmallCount / shortTermHistory.length > shortTermBiasThreshold) {
-         if (prediction === "SMALL") confidence = Math.max(confidence, 60);
-        else { prediction = "BIG"; confidence = Math.max(confidence, 70); }
-    }
-    return { prediction, confidence: Math.min(95, confidence) };
-}
-
-function recoveryHeuristic(history, currentSystemLosses) {
-    if (currentSystemLosses === 0) return { prediction: null, confidence: 0 };
-    const lastResolvedResults = history.filter(h => h.actual !== null).slice(0, Math.min(currentSystemLosses, 3));
-    if (lastResolvedResults.length === 0) return { prediction: null, confidence: 0 };
-    const lastActual = Number(lastResolvedResults[0].actual);
-    if (isNaN(lastActual)) return { prediction: null, confidence: 0 };
-    let prediction = null;
-    let confidence = 0;
-    if (currentSystemLosses === 1) {
-        prediction = getBigSmallType(lastActual) === "BIG" ? "SMALL" : "BIG";
-        confidence = 99.0;
-    } else if (currentSystemLosses === 2) {
-        if (lastResolvedResults.length >= 2) {
-            const secondLastActual = Number(lastResolvedResults[1].actual);
-            const lastType = getBigSmallType(lastActual);
-            const secondLastType = getBigSmallType(secondLastActual);
-            if (lastType === secondLastType) {
-                prediction = lastType === "BIG" ? "SMALL" : "BIG";
-                confidence = 99.5;
-            } else {
-                prediction = getBigSmallType(lastActual) === "BIG" ? "SMALL" : "BIG";
-                confidence = 99.5;
-            }
-        } else {
-            prediction = getBigSmallType(lastActual) === "BIG" ? "SMALL" : "BIG";
-            confidence = 99.5;
-        }
-    } else if (currentSystemLosses >= 3) {
-        const types = history.slice(0, Math.min(history.length, 5)).map(h => getBigSmallType(Number(h.actual)));
-        const bigCount = types.filter(t => t === "BIG").length;
-        const smallCount = types.length - bigCount;
-        if (bigCount > smallCount + 1) {
-            prediction = "SMALL";
-            confidence = 100.0;
-        } else if (smallCount > bigCount + 1) {
-            prediction = "BIG";
-            confidence = 100.0;
-        } else {
-            const bigWins = history.filter(h => h.status === 'win' && getBigSmallType(Number(h.actual)) === "BIG").length;
-            const smallWins = history.filter(h => h.status === 'win' && getBigSmallType(Number(h.actual)) === "SMALL").length;
-            if (bigWins < smallWins) {
-                prediction = "BIG";
-                confidence = 100.0;
-            } else if (smallWins < bigWins) {
-                prediction = "SMALL";
-                confidence = 100.0;
-            } else {
-                prediction = getBigSmallType(lastActual) === "BIG" ? "SMALL" : "BIG";
-                confidence = 100.0;
-            }
-        }
-    }
-    return { prediction, confidence };
-}
-
-function balanceHeuristic(history) {
-    if (history.length < 20) return { prediction: null, confidence: 0 };
-    const longTermHistory = history.slice(0, 50);
-    const bigCount = longTermHistory.filter(h => getBigSmallType(Number(h.actual)) === "BIG").length;
-    const smallCount = longTermHistory.length - bigCount;
-    let prediction = null;
-    let confidence = 0;
-    const balanceThreshold = 0.53;
-    const bigRatio = bigCount / longTermHistory.length;
-    const smallRatio = smallCount / longTermHistory.length;
-    if (bigRatio > balanceThreshold) {
-        prediction = "SMALL";
-        confidence = 60 + (bigRatio - balanceThreshold) * 100;
-    } else if (smallRatio > balanceThreshold) {
-        prediction = "BIG";
-        confidence = 60 + (smallRatio - balanceThreshold) * 100;
-    }
-    return { prediction, confidence: Math.min(90, confidence) };
-}
-
-function trendHeuristic(history) {
-    if (history.length < 3) return { prediction: null, confidence: 0 };
-    const recentTypes = history.slice(0, 5).map(h => getBigSmallType(Number(h.actual)));
-    const mediumTypes = history.slice(0, 10).map(h => getBigSmallType(Number(h.actual)));
-    let prediction = null;
-    let confidence = 0;
-    if (recentTypes.length >= 3 && recentTypes[0] === recentTypes[1] && recentTypes[1] === recentTypes[2]) {
-        prediction = recentTypes[0];
-        confidence = 80;
-    }
-    else if (recentTypes.length >= 3) {
-        const lastFewBig = recentTypes.slice(0,3).filter(t => t === "BIG").length;
-        const lastFewSmall = 3 - lastFewBig;
-        if (lastFewBig > lastFewSmall) { prediction = "BIG"; confidence = 68;}
-        else if (lastFewSmall > lastFewBig) { prediction = "SMALL"; confidence = 68; }
-    }
-    if (!prediction && mediumTypes.length >= 7) {
-        const mediumBigCount = mediumTypes.filter(t => t === "BIG").length;
-        const mediumSmallCount = mediumTypes.length - mediumBigCount;
-        const mediumBiasThreshold = 0.7;
-        if (mediumBigCount / mediumTypes.length > mediumBiasThreshold) { prediction = "BIG"; confidence = 70;}
-        else if (mediumSmallCount / mediumTypes.length > mediumBiasThreshold) { prediction = "SMALL"; confidence = 70;}
-    }
-    return { prediction, confidence };
-}
-
-function oscillationHeuristic(history) {
-    if (history.length < 4) return { prediction: null, confidence: 0 };
-    const types = history.slice(0, 4).map(h => getBigSmallType(Number(h.actual)));
-    if (types[0] !== types[1] && types[1] !== types[2] && types[2] !== types[3] && types[0] === types[2] && types[1] === types[3]) {
-        return { prediction: types[0], confidence: 85 };
-    }
-    return { prediction: null, confidence: 0 };
-}
-
-function microTrendHeuristic(history) {
-    if (history.length < 2) return { prediction: null, confidence: 0 };
-    const types = history.slice(0, 2).map(h => getBigSmallType(Number(h.actual)));
-    if (types.length >= 2 && types[0] === types[1]) {
-        return { prediction: types[0], confidence: 65 };
-    }
-    return { prediction: null, confidence: 0 };
-}
-
-function deviationHeuristic(history) {
-    if (history.length < 15) return { prediction: null, confidence: 0 };
-    const analysisDepth = Math.min(history.length, 30);
-    const recentNumbers = history.slice(0, analysisDepth).map(h => Number(h.actual));
-    const bigCount = recentNumbers.filter(n => n >= 5).length;
-    const smallCount = recentNumbers.filter(n => n < 5).length;
-    let prediction = null;
-    let confidence = 0;
-    const numberBiasThreshold = 0.6;
-    if (bigCount / analysisDepth > numberBiasThreshold) {
-        prediction = "SMALL";
-        confidence = 75 + (bigCount / analysisDepth - numberBiasThreshold) * 100;
-    } else if (smallCount / analysisDepth > numberBiasThreshold) {
-        prediction = "BIG";
-        confidence = 75 + (smallCount / analysisDepth - numberBiasThreshold) * 100;
-    }
-    const oddCount = recentNumbers.filter(n => n % 2 !== 0).length;
-    const evenCount = recentNumbers.filter(n => n % 2 === 0).length;
-    if (oddCount / analysisDepth > numberBiasThreshold) {
-        if (recentNumbers[0] % 2 !== 0) {
-            prediction = (Number(recentNumbers[0]) < 5) ? "BIG" : "SMALL";
-            confidence = Math.max(confidence, 70);
-        }
-    } else if (evenCount / analysisDepth > numberBiasThreshold) {
-        if (recentNumbers[0] % 2 === 0) {
-            prediction = (Number(recentNumbers[0]) < 5) ? "BIG" : "SMALL";
-            confidence = Math.max(confidence, 70);
-        }
-    }
-    return { prediction, confidence: Math.min(95, confidence) };
-}
-
-function simpleHeuristic(history) {
-    if (history.length === 0 || history[0].actual === null || isNaN(Number(history[0].actual))) return { prediction: null, confidence: 0 };
-    const lastActual = Number(history[0].actual);
-    return {
-        prediction: getBigSmallType(lastActual) === "BIG" ? "SMALL" : "BIG",
-        confidence: 50
-    };
-}
-
-// --- TRADE X AI Signals ---
-function analyzePeriodNumerology(periodNumber) {
-    if (!periodNumber) return null;
-    const s = String(periodNumber);
-    const digits = s.slice(-5).split('').map(Number);
-    if (digits.length < 3) return null;
-    const sum = digits.reduce((a, b) => a + b, 0);
-    const prod = digits.reduce((a, b) => a * b, 1);
-    const xor = digits.reduce((a, b) => a ^ b, 0);
-    const lastDigit = digits[digits.length - 1];
-    let primeScore = 0;
-    digits.forEach(d => { if(isPrime(d)) primeScore++; });
-    let fibScore = 0;
-    digits.forEach(d => { if(fibonacci(d)) fibScore++; });
-    const lyap = calculateLyapunov(digits);
-    let bigScore = 0;
-    let smallScore = 0;
-    if (sum % 2 === 0) bigScore += sum / 10; else smallScore += sum / 10;
-    if (prod > 100) bigScore += prod / 100; else smallScore += 5;
-    if (xor > 5) bigScore += xor; else smallScore += xor;
-    if (lastDigit > 4) bigScore += lastDigit; else smallScore += (9 - lastDigit);
-    bigScore += primeScore * 5;
-    smallScore += fibScore * 4;
-    if (lyap > 2.5) bigScore += lyap * 2; else smallScore += lyap * 3;
-    const prediction = bigScore > smallScore ? "BIG" : "SMALL";
-    const confidence = Math.abs(bigScore - smallScore) / (bigScore + smallScore + 1);
-    return { prediction, confidence: confidence * 100 };
-}
-
-function analyzeARIMA(history) {
-    const numbers = history.map(entry => parseInt(entry.actual)).filter(n => !isNaN(n));
-    if (numbers.length < 10) return null;
-    const diffs = [];
-    for (let i = 0; i < 9; i++) {
-        diffs.push(numbers[i] - numbers[i+1]);
-    }
-    const avgDiff = diffs.reduce((a,b) => a+b, 0) / diffs.length;
-    const forecast = numbers[0] + avgDiff;
-    const prediction = forecast > 4.5 ? "BIG" : "SMALL";
-    const confidence = Math.min(1.0, Math.abs(forecast - 4.5) / 4.5);
-    return { prediction, confidence: confidence * 100 };
-}
-
-function analyzeLSTMPattern(history) {
-    const outcomes = history.map(p => getBigSmallType(p.actual)).filter(Boolean);
-    if (outcomes.length < 5) return null;
-    const sequence = outcomes.slice(0, 5).join('');
-    const patterns = {
-        'BIGBIGSMALLSMALLBIG': { prediction: 'BIG', conf: 0.8 },
-        'SMALLSMALLBIGBIGSMALL': { prediction: 'SMALL', conf: 0.8 },
-        'BIGSMALLBIGSMALLBIG': { prediction: 'SMALL', conf: 0.75 },
-        'SMALLBIGSMALLBIGSMALL': { prediction: 'BIG', conf: 0.75 }
-    };
-    if (patterns[sequence]) {
-        return {
-            prediction: patterns[sequence].prediction,
-            confidence: patterns[sequence].conf * 100
-        };
-    }
-    return null;
-}
-
-function getQLearningInsight(history) {
-    const outcomes = history.map(p => getBigSmallType(p.actual)).filter(Boolean);
-    if (outcomes.length < 4) return null;
-    const state = outcomes.slice(0, 4).join('-');
-    if (!qTable[state]) {
-        return null;
-    }
-    return { state: state, qValues: { BIG: qTable[state].BIG, SMALL: qTable[state].SMALL } };
-}
-
-function analyzeIchimokuCloud(history, tenkanPeriod, kijunPeriod, senkouBPeriod) {
-    if (tenkanPeriod <=0 || kijunPeriod <=0 || senkouBPeriod <=0) return null;
-    const chronologicalHistory = history.slice().reverse();
-    const numbers = chronologicalHistory.map(entry => parseInt(entry.actual)).filter(n => !isNaN(n));
-    if (numbers.length < Math.max(senkouBPeriod, kijunPeriod) + 5) return null;
-    const getHighLow = (dataSlice) => {
-        if (!dataSlice || dataSlice.length === 0) return { high: null, low: null };
-        return { high: Math.max(...dataSlice), low: Math.min(...dataSlice) };
-    };
-    const calculateLine = (data, period) => {
-        const lineValues = [];
-        for (let i = 0; i < data.length; i++) {
-            if (i < period - 1) { lineValues.push(null); continue; }
-            const { high, low } = getHighLow(data.slice(i - period + 1, i + 1));
-            if (high !== null && low !== null) lineValues.push((high + low) / 2); else lineValues.push(null);
-        }
-        return lineValues;
-    };
-    const tenkanSenValues = calculateLine(numbers, tenkanPeriod);
-    const kijunSenValues = calculateLine(numbers, kijunPeriod);
-    const senkouSpanBValues = calculateLine(numbers, senkouBPeriod);
-    const currentTenkan = tenkanSenValues[numbers.length - 1];
-    const prevTenkan = tenkanSenValues[numbers.length - 2];
-    const currentKijun = kijunSenValues[numbers.length - 1];
-    const prevKijun = kijunSenValues[numbers.length - 2];
-    const senkouSpanAValues = [];
-    for(let i=0; i < numbers.length; i++) {
-        if (tenkanSenValues[i] !== null && kijunSenValues[i] !== null) {
-            senkouSpanAValues.push((tenkanSenValues[i] + kijunSenValues[i]) / 2);
-        } else {
-            senkouSpanAValues.push(null);
-        }
-    }
-    const kijunLag = kijunPeriod;
-    const currentSenkouA = (numbers.length > kijunLag && senkouSpanAValues.length > numbers.length - 1 - kijunLag) ? senkouSpanAValues[numbers.length - 1 - kijunLag] : null;
-    const currentSenkouB = (numbers.length > kijunLag && senkouSpanBValues.length > numbers.length - 1 - kijunLag) ? senkouSpanBValues[numbers.length - 1 - kijunLag] : null;
-    const chikouSpan = numbers[numbers.length - 1];
-    const priceKijunPeriodsAgo = numbers.length > kijunPeriod ? numbers[numbers.length - 1 - kijunPeriod] : null;
-    const lastPrice = numbers[numbers.length - 1];
-    if (lastPrice === null || currentTenkan === null || currentKijun === null || currentSenkouA === null || currentSenkouB === null || chikouSpan === null || priceKijunPeriodsAgo === null) {
-        return null;
-    }
-    let prediction = null;
-    let strengthFactor = 0.3;
-    let summary = [];
-    let tkCrossSignal = null;
-    if (prevTenkan !== null && prevKijun !== null) {
-        if (prevTenkan <= prevKijun && currentTenkan > currentKijun) { tkCrossSignal = "BIG"; summary.push("TK Cross: Bullish"); }
-        else if (prevTenkan >= prevKijun && currentTenkan < currentKijun) { tkCrossSignal = "SMALL"; summary.push("TK Cross: Bearish"); }
-    }
-    const cloudTop = Math.max(currentSenkouA, currentSenkouB);
-    const cloudBottom = Math.min(currentSenkouA, currentSenkouB);
-    let priceVsCloudSignal = null;
-    if (lastPrice > cloudTop) { priceVsCloudSignal = "BIG"; summary.push("Price above Cloud (Bullish)"); }
-    else if (lastPrice < cloudBottom) { priceVsCloudSignal = "SMALL"; summary.push("Price below Cloud (Bearish)"); }
-    else { summary.push("Price within Cloud (Neutral)"); }
-    let chikouSignal = null;
-    if (priceKijunPeriodsAgo !== null) {
-        if (chikouSpan > priceKijunPeriodsAgo) { chikouSignal = "BIG"; summary.push("Chikou Span above past price (Bullish)"); }
-        else if (chikouSpan < priceKijunPeriodsAgo) { chikouSignal = "SMALL"; summary.push("Chikou Span below past price (Bearish)"); }
-    }
-    if (tkCrossSignal && tkCrossSignal === priceVsCloudSignal && tkCrossSignal === chikouSignal) {
-        prediction = tkCrossSignal; strengthFactor = 0.95;
-    }
-    else if (priceVsCloudSignal && priceVsCloudSignal === tkCrossSignal) {
-        prediction = priceVsCloudSignal; strengthFactor = 0.7;
-    }
-    else if (priceVsCloudSignal && priceVsCloudSignal === chikouSignal) {
-        prediction = priceVsCloudSignal; strengthFactor = 0.65;
-    }
-    else if (tkCrossSignal && priceVsCloudSignal) {
-        prediction = tkCrossSignal; strengthFactor = 0.55;
-    }
-    else if (priceVsCloudSignal) {
-        prediction = priceVsCloudSignal; strengthFactor = 0.5;
-    }
-    if (prediction) return { prediction, confidence: strengthFactor * 100, summary: `Ichimoku: ${summary.join(', ')}` };
-    return null;
-}
-
-// --- Market Context, Trend, and Stability Analysis ---
+// --- Market Context Analysis ---
 function getMarketRegimeAndTrendContext(history, shortMALookback = 5, mediumMALookback = 10, longMALookback = 20) {
     const baseContext = getTrendContext(history, shortMALookback, mediumMALookback, longMALookback);
     let macroRegime = "UNCERTAIN";
     const { strength, volatility } = baseContext;
     let isTransitioning = false;
-    const numbers = history.map(entry => parseInt(entry.actual)).filter(n => !isNaN(n));
+
+    const numbers = history.map(entry => parseInt(entry.actualNumber || entry.actual)).filter(n => !isNaN(n));
+
     if (numbers.length > mediumMALookback + 5) {
         const prevShortMA = calculateEMA(numbers.slice(1), shortMALookback);
         const prevMediumMA = calculateEMA(numbers.slice(1), mediumMALookback);
         const currentShortMA = calculateEMA(numbers, shortMALookback);
         const currentMediumMA = calculateEMA(numbers, mediumMALookback);
+
         if (prevShortMA && prevMediumMA && currentShortMA && currentMediumMA) {
             if ((prevShortMA <= prevMediumMA && currentShortMA > currentMediumMA) ||
                 (prevShortMA >= prevMediumMA && currentShortMA < currentMediumMA)) {
@@ -683,6 +240,7 @@ function getMarketRegimeAndTrendContext(history, shortMALookback = 5, mediumMALo
             }
         }
     }
+
     if (strength === "STRONG") {
         if (volatility === "LOW" || volatility === "VERY_LOW") macroRegime = "TREND_STRONG_LOW_VOL";
         else if (volatility === "MEDIUM") macroRegime = "TREND_STRONG_MED_VOL";
@@ -695,14 +253,16 @@ function getMarketRegimeAndTrendContext(history, shortMALookback = 5, mediumMALo
         if (volatility === "LOW" || volatility === "VERY_LOW") macroRegime = "RANGE_LOW_VOL";
         else if (volatility === "MEDIUM") macroRegime = "RANGE_MED_VOL";
         else macroRegime = "RANGE_HIGH_VOL";
-    } else {
+    } else { // WEAK or UNKNOWN
         if (volatility === "HIGH") macroRegime = "WEAK_HIGH_VOL";
         else if (volatility === "MEDIUM") macroRegime = "WEAK_MED_VOL";
         else macroRegime = "WEAK_LOW_VOL";
     }
+
     if (isTransitioning && !macroRegime.includes("TRANSITION")) {
         macroRegime += "_TRANSITION";
     }
+
     baseContext.macroRegime = macroRegime;
     baseContext.isTransitioning = isTransitioning;
     baseContext.details += `,Regime:${macroRegime}`;
@@ -713,21 +273,27 @@ function getTrendContext(history, shortMALookback = 5, mediumMALookback = 10, lo
     if (!Array.isArray(history) || history.length < longMALookback) {
         return { strength: "UNKNOWN", direction: "NONE", volatility: "UNKNOWN", details: "Insufficient history", macroRegime: "UNKNOWN_REGIME", isTransitioning: false };
     }
-    const numbers = history.map(entry => parseInt(entry.actual)).filter(n => !isNaN(n));
+    const numbers = history.map(entry => parseInt(entry.actualNumber || entry.actual)).filter(n => !isNaN(n));
     if (numbers.length < longMALookback) {
         return { strength: "UNKNOWN", direction: "NONE", volatility: "UNKNOWN", details: "Insufficient numbers", macroRegime: "UNKNOWN_REGIME", isTransitioning: false };
     }
+
     const shortMA = calculateEMA(numbers, shortMALookback);
     const mediumMA = calculateEMA(numbers, mediumMALookback);
     const longMA = calculateEMA(numbers, longMALookback);
+
     if (shortMA === null || mediumMA === null || longMA === null) return { strength: "UNKNOWN", direction: "NONE", volatility: "UNKNOWN", details: "MA calculation failed", macroRegime: "UNKNOWN_REGIME", isTransitioning: false };
+
     let direction = "NONE";
     let strength = "WEAK";
     let details = `S:${shortMA.toFixed(1)},M:${mediumMA.toFixed(1)},L:${longMA.toFixed(1)}`;
+
     const stdDevLong = calculateStdDev(numbers, longMALookback);
     const epsilon = 0.001;
     const normalizedSpread = (stdDevLong !== null && stdDevLong > epsilon) ? (shortMA - longMA) / stdDevLong : (shortMA - longMA) / epsilon;
+
     details += `,NormSpread:${normalizedSpread.toFixed(2)}`;
+
     if (shortMA > mediumMA && mediumMA > longMA) {
         direction = "BIG";
         if (normalizedSpread > 0.80) strength = "STRONG";
@@ -743,6 +309,7 @@ function getTrendContext(history, shortMALookback = 5, mediumMALookback = 10, lo
         if (shortMA > longMA) direction = "BIG_BIASED_RANGE";
         else if (longMA > shortMA) direction = "SMALL_BIASED_RANGE";
     }
+
     let volatility = "UNKNOWN";
     const volSlice = numbers.slice(0, Math.min(numbers.length, 30));
     if (volSlice.length >= 15) {
@@ -758,23 +325,500 @@ function getTrendContext(history, shortMALookback = 5, mediumMALookback = 10, lo
     return { strength, direction, volatility, details, macroRegime: "PENDING_REGIME_CLASSIFICATION", isTransitioning: false };
 }
 
+
+// --- Core Analytical Modules ---
+function analyzeTransitions(history, baseWeight) {
+    if (!Array.isArray(history) || history.length < 15) return null;
+    const transitions = { "BIG": { "BIG": 0, "SMALL": 0, "total": 0 }, "SMALL": { "BIG": 0, "SMALL": 0, "total": 0 } };
+    for (let i = 0; i < history.length - 1; i++) {
+        const currentBS = getBigSmallFromNumber(history[i]?.actual);
+        const prevBS = getBigSmallFromNumber(history[i + 1]?.actual);
+        if (currentBS && prevBS && transitions[prevBS]) {
+            transitions[prevBS][currentBS]++;
+            transitions[prevBS].total++;
+        }
+    }
+    const lastOutcome = getBigSmallFromNumber(history[0]?.actual);
+    if (!lastOutcome || !transitions[lastOutcome] || transitions[lastOutcome].total < 6) return null;
+    const nextBigProb = transitions[lastOutcome]["BIG"] / transitions[lastOutcome].total;
+    const nextSmallProb = transitions[lastOutcome]["SMALL"] / transitions[lastOutcome].total;
+    if (nextBigProb > nextSmallProb + 0.30) return { prediction: "BIG", weight: baseWeight * nextBigProb, source: "Transition" };
+    if (nextSmallProb > nextBigProb + 0.30) return { prediction: "SMALL", weight: baseWeight * nextSmallProb, source: "Transition" };
+    return null;
+}
+function analyzeStreaks(history, baseWeight) {
+    if (!Array.isArray(history) || history.length < 3) return null;
+    const actuals = history.map(p => getBigSmallFromNumber(p.actual)).filter(bs => bs);
+    if (actuals.length < 3) return null;
+    let currentStreakType = actuals[0], currentStreakLength = 0;
+    for (const outcome of actuals) {
+        if (outcome === currentStreakType) currentStreakLength++; else break;
+    }
+    if (currentStreakLength >= 2) {
+        const prediction = getOppositeOutcome(currentStreakType);
+        const weightFactor = Math.min(0.45 + (currentStreakLength * 0.18), 0.95);
+        return { prediction, weight: baseWeight * weightFactor, source: `StreakBreak-${currentStreakLength}` };
+    }
+    return null;
+}
+function analyzeAlternatingPatterns(history, baseWeight) {
+    if (!Array.isArray(history) || history.length < 5) return null;
+    const actuals = history.slice(0, 5).map(p => getBigSmallFromNumber(p.actual)).filter(bs => bs);
+    if (actuals.length < 4) return null;
+    if (actuals[0] === "SMALL" && actuals[1] === "BIG" && actuals[2] === "SMALL" && actuals[3] === "BIG")
+        return { prediction: "SMALL", weight: baseWeight * 1.15, source: "Alt-BSBS->S" };
+    if (actuals[0] === "BIG" && actuals[1] === "SMALL" && actuals[2] === "BIG" && actuals[3] === "SMALL")
+        return { prediction: "BIG", weight: baseWeight * 1.15, source: "Alt-SBSB->B" };
+    return null;
+}
+function analyzeRSI(history, rsiPeriod, baseWeight, volatility) {
+    if (rsiPeriod <= 0) return null;
+    const actualNumbers = history.map(entry => parseInt(entry.actualNumber || entry.actual)).filter(num => !isNaN(num));
+    if (actualNumbers.length < rsiPeriod + 1) return null;
+
+    const rsiValue = calculateRSI(actualNumbers, rsiPeriod);
+    if (rsiValue === null) return null;
+
+    let overbought = 70; let oversold = 30;
+    if (volatility === "HIGH") { overbought = 80; oversold = 20; }
+    else if (volatility === "MEDIUM") { overbought = 75; oversold = 25; }
+    else if (volatility === "LOW") { overbought = 68; oversold = 32; }
+    else if (volatility === "VERY_LOW") { overbought = 65; oversold = 35; }
+
+
+    let prediction = null, signalStrengthFactor = 0;
+    if (rsiValue < oversold) { prediction = "BIG"; signalStrengthFactor = (oversold - rsiValue) / oversold; }
+    else if (rsiValue > overbought) { prediction = "SMALL"; signalStrengthFactor = (rsiValue - overbought) / (100 - overbought); }
+
+    if (prediction)
+        return { prediction, weight: baseWeight * (0.60 + Math.min(signalStrengthFactor, 1.0) * 0.40), source: "RSI" };
+    return null;
+}
+function analyzeMACD(history, shortPeriod, longPeriod, signalPeriod, baseWeight) {
+    if (shortPeriod <=0 || longPeriod <=0 || signalPeriod <=0 || shortPeriod >= longPeriod) return null;
+    const actualNumbers = history.map(entry => parseInt(entry.actualNumber || entry.actual)).filter(num => !isNaN(num));
+    if (actualNumbers.length < longPeriod + signalPeriod -1) return null;
+
+    const emaShort = calculateEMA(actualNumbers, shortPeriod);
+    const emaLong = calculateEMA(actualNumbers, longPeriod);
+
+    if (emaShort === null || emaLong === null) return null;
+    const macdLineCurrent = emaShort - emaLong;
+
+    const macdLineValues = [];
+    for (let i = longPeriod -1; i < actualNumbers.length; i++) {
+        const currentSlice = actualNumbers.slice(actualNumbers.length - 1 - i);
+        const shortE = calculateEMA(currentSlice, shortPeriod);
+        const longE = calculateEMA(currentSlice, longPeriod);
+        if (shortE !== null && longE !== null) {
+            macdLineValues.push(shortE - longE);
+        }
+    }
+
+    if (macdLineValues.length < signalPeriod) return null;
+
+    const signalLine = calculateEMA(macdLineValues.slice().reverse(), signalPeriod);
+    if (signalLine === null) return null;
+
+    const macdHistogram = macdLineCurrent - signalLine;
+    let prediction = null;
+
+    if (macdLineValues.length >= signalPeriod + 1) {
+        const prevMacdSliceForSignal = macdLineValues.slice(0, -1);
+        const prevSignalLine = calculateEMA(prevMacdSliceForSignal.slice().reverse(), signalPeriod);
+        const prevMacdLine = macdLineValues[macdLineValues.length - 2];
+
+        if (prevSignalLine !== null && prevMacdLine !== null) {
+            if (prevMacdLine <= prevSignalLine && macdLineCurrent > signalLine) prediction = "BIG";
+            else if (prevMacdLine >= prevSignalLine && macdLineCurrent < signalLine) prediction = "SMALL";
+        }
+    }
+
+    if (!prediction) {
+        if (macdHistogram > 0.25) prediction = "BIG";
+        else if (macdHistogram < -0.25) prediction = "SMALL";
+    }
+
+    if (prediction) {
+        const strengthFactor = Math.min(Math.abs(macdHistogram) / 0.6, 1.0);
+        return { prediction, weight: baseWeight * (0.55 + strengthFactor * 0.45), source: `MACD_${prediction === "BIG" ? "CrossB" : "CrossS"}` };
+    }
+    return null;
+}
+function analyzeBollingerBands(history, period, stdDevMultiplier, baseWeight) {
+    if (period <= 0) return null;
+    const actualNumbers = history.map(entry => parseInt(entry.actualNumber || entry.actual)).filter(num => !isNaN(num));
+    if (actualNumbers.length < period) return null;
+
+    const sma = calculateSMA(actualNumbers.slice(0, period), period);
+    if (sma === null) return null;
+
+    const stdDev = calculateStdDev(actualNumbers, period);
+    if (stdDev === null || stdDev < 0.05) return null;
+
+    const upperBand = sma + (stdDev * stdDevMultiplier);
+    const lowerBand = sma - (stdDev * stdDevMultiplier);
+    const lastNumber = actualNumbers[0];
+    let prediction = null;
+
+    if (lastNumber > upperBand * 1.01) prediction = "SMALL";
+    else if (lastNumber < lowerBand * 0.99) prediction = "BIG";
+
+    if (prediction) {
+        const bandBreachStrength = Math.abs(lastNumber - sma) / (stdDev * stdDevMultiplier + 0.001);
+        return { prediction, weight: baseWeight * (0.65 + Math.min(bandBreachStrength, 0.9)*0.35), source: "Bollinger" };
+    }
+    return null;
+}
+function analyzeIchimokuCloud(history, tenkanPeriod, kijunPeriod, senkouBPeriod, baseWeight) {
+    if (tenkanPeriod <=0 || kijunPeriod <=0 || senkouBPeriod <=0) return null;
+    const chronologicalHistory = history.slice().reverse();
+    const numbers = chronologicalHistory.map(entry => parseInt(entry.actualNumber || entry.actual)).filter(n => !isNaN(n));
+
+    if (numbers.length < Math.max(senkouBPeriod, kijunPeriod) + kijunPeriod -1 ) return null;
+
+    const getHighLow = (dataSlice) => {
+        if (!dataSlice || dataSlice.length === 0) return { high: null, low: null };
+        return { high: Math.max(...dataSlice), low: Math.min(...dataSlice) };
+    };
+
+    const tenkanSenValues = [];
+    for (let i = 0; i < numbers.length; i++) {
+        if (i < tenkanPeriod - 1) { tenkanSenValues.push(null); continue; }
+        const { high, low } = getHighLow(numbers.slice(i - tenkanPeriod + 1, i + 1));
+        if (high !== null && low !== null) tenkanSenValues.push((high + low) / 2); else tenkanSenValues.push(null);
+    }
+
+    const kijunSenValues = [];
+    for (let i = 0; i < numbers.length; i++) {
+        if (i < kijunPeriod - 1) { kijunSenValues.push(null); continue; }
+        const { high, low } = getHighLow(numbers.slice(i - kijunPeriod + 1, i + 1));
+        if (high !== null && low !== null) kijunSenValues.push((high + low) / 2); else kijunSenValues.push(null);
+    }
+
+    const currentTenkan = tenkanSenValues[numbers.length - 1];
+    const prevTenkan = tenkanSenValues[numbers.length - 2];
+    const currentKijun = kijunSenValues[numbers.length - 1];
+    const prevKijun = kijunSenValues[numbers.length - 2];
+
+    const senkouSpanAValues = [];
+    for(let i=0; i < numbers.length; i++) {
+        if (tenkanSenValues[i] !== null && kijunSenValues[i] !== null) {
+            senkouSpanAValues.push((tenkanSenValues[i] + kijunSenValues[i]) / 2);
+        } else {
+            senkouSpanAValues.push(null);
+        }
+    }
+
+    const senkouSpanBValues = [];
+    for (let i = 0; i < numbers.length; i++) {
+        if (i < senkouBPeriod -1) { senkouSpanBValues.push(null); continue; }
+        const { high, low } = getHighLow(numbers.slice(i - senkouBPeriod + 1, i + 1));
+        if (high !== null && low !== null) senkouSpanBValues.push((high + low) / 2); else senkouSpanBValues.push(null);
+    }
+
+    const currentSenkouA = (numbers.length > kijunPeriod && senkouSpanAValues.length > numbers.length - 1 - kijunPeriod) ? senkouSpanAValues[numbers.length - 1 - kijunPeriod] : null;
+    const currentSenkouB = (numbers.length > kijunPeriod && senkouSpanBValues.length > numbers.length - 1 - kijunPeriod) ? senkouSpanBValues[numbers.length - 1 - kijunPeriod] : null;
+
+
+    const chikouSpan = numbers[numbers.length - 1];
+    const priceKijunPeriodsAgo = numbers.length > kijunPeriod ? numbers[numbers.length - 1 - kijunPeriod] : null;
+
+    const lastPrice = numbers[numbers.length - 1];
+    if (lastPrice === null || currentTenkan === null || currentKijun === null || currentSenkouA === null || currentSenkouB === null || chikouSpan === null || priceKijunPeriodsAgo === null) {
+        return null;
+    }
+
+    let prediction = null;
+    let strengthFactor = 0.3;
+
+    let tkCrossSignal = null;
+    if (prevTenkan !== null && prevKijun !== null) {
+        if (prevTenkan <= prevKijun && currentTenkan > currentKijun) tkCrossSignal = "BIG";
+        else if (prevTenkan >= prevKijun && currentTenkan < currentKijun) tkCrossSignal = "SMALL";
+    }
+
+    const cloudTop = Math.max(currentSenkouA, currentSenkouB);
+    const cloudBottom = Math.min(currentSenkouA, currentSenkouB);
+    let priceVsCloudSignal = null;
+    if (lastPrice > cloudTop) priceVsCloudSignal = "BIG";
+    else if (lastPrice < cloudBottom) priceVsCloudSignal = "SMALL";
+
+    let chikouSignal = null;
+    if (chikouSpan > priceKijunPeriodsAgo) chikouSignal = "BIG";
+    else if (chikouSpan < priceKijunPeriodsAgo) chikouSignal = "SMALL";
+
+    if (tkCrossSignal && tkCrossSignal === priceVsCloudSignal && tkCrossSignal === chikouSignal) {
+        prediction = tkCrossSignal; strengthFactor = 0.95;
+    }
+    else if (priceVsCloudSignal && priceVsCloudSignal === tkCrossSignal && chikouSignal === priceVsCloudSignal) {
+        prediction = priceVsCloudSignal; strengthFactor = 0.85;
+    }
+    else if (priceVsCloudSignal && priceVsCloudSignal === tkCrossSignal) {
+        prediction = priceVsCloudSignal; strengthFactor = 0.7;
+    }
+    else if (priceVsCloudSignal && priceVsCloudSignal === chikouSignal) {
+        prediction = priceVsCloudSignal; strengthFactor = 0.65;
+    }
+    else if (tkCrossSignal && priceVsCloudSignal) {
+        prediction = tkCrossSignal; strengthFactor = 0.55;
+    }
+    else if (priceVsCloudSignal) {
+         prediction = priceVsCloudSignal; strengthFactor = 0.5;
+    }
+
+    if (prediction === "BIG" && lastPrice > currentKijun && prevKijun !== null && numbers[numbers.length-2] <= prevKijun && priceVsCloudSignal === "BIG") {
+        strengthFactor = Math.min(1.0, strengthFactor + 0.15);
+    } else if (prediction === "SMALL" && lastPrice < currentKijun && prevKijun !== null && numbers[numbers.length-2] >= prevKijun && priceVsCloudSignal === "SMALL") {
+        strengthFactor = Math.min(1.0, strengthFactor + 0.15);
+    }
+
+    if (prediction) return { prediction, weight: baseWeight * strengthFactor, source: "Ichimoku" };
+    return null;
+}
+function calculateEntropyForSignal(outcomes, windowSize) {
+    if (!Array.isArray(outcomes) || outcomes.length < windowSize) return null;
+    const counts = { BIG: 0, SMALL: 0 };
+    outcomes.slice(0, windowSize).forEach(o => { if (o) counts[o] = (counts[o] || 0) + 1; });
+    let entropy = 0;
+    const totalValidOutcomes = counts.BIG + counts.SMALL;
+    if (totalValidOutcomes === 0) return 1;
+    for (let key in counts) {
+        if (counts[key] > 0) { const p = counts[key] / totalValidOutcomes; entropy -= p * Math.log2(p); }
+    }
+    return isNaN(entropy) ? 1 : entropy;
+}
+function analyzeVolatilityBreakout(history, trendContext, baseWeight) {
+    if (trendContext.volatility === "VERY_LOW" && history.length >= 3) {
+        const lastOutcome = getBigSmallFromNumber(history[0].actual);
+        const prevOutcome = getBigSmallFromNumber(history[1].actual);
+        if (lastOutcome && prevOutcome && lastOutcome === prevOutcome) return { prediction: lastOutcome, weight: baseWeight * 0.8, source: "VolSqueezeBreakoutCont" };
+        if (lastOutcome && prevOutcome && lastOutcome !== prevOutcome) return { prediction: lastOutcome, weight: baseWeight * 0.6, source: "VolSqueezeBreakoutInitial" };
+    }
+    return null;
+}
+function analyzeStochastic(history, kPeriod, dPeriod, smoothK, baseWeight, volatility) {
+    if (kPeriod <=0 || dPeriod <=0 || smoothK <=0) return null;
+    const actualNumbers = history.map(entry => parseInt(entry.actualNumber || entry.actual)).filter(num => !isNaN(num));
+    if (actualNumbers.length < kPeriod + smoothK -1 + dPeriod -1) return null;
+
+    const chronologicalNumbers = actualNumbers.slice().reverse();
+
+    let kValues = [];
+    for (let i = kPeriod - 1; i < chronologicalNumbers.length; i++) {
+        const currentSlice = chronologicalNumbers.slice(i - kPeriod + 1, i + 1);
+        const currentClose = currentSlice[currentSlice.length - 1];
+        const lowestLow = Math.min(...currentSlice);
+        const highestHigh = Math.max(...currentSlice);
+        if (highestHigh === lowestLow) kValues.push(kValues.length > 0 ? kValues[kValues.length-1] : 50);
+        else kValues.push(100 * (currentClose - lowestLow) / (highestHigh - lowestLow));
+    }
+
+    if (kValues.length < smoothK) return null;
+    const smoothedKValues = [];
+    for(let i = 0; i <= kValues.length - smoothK; i++) {
+        smoothedKValues.push(calculateSMA(kValues.slice(i, i + smoothK).slice().reverse(), smoothK));
+    }
+
+    if (smoothedKValues.length < dPeriod) return null;
+    const dValues = [];
+    for(let i = 0; i <= smoothedKValues.length - dPeriod; i++) {
+        dValues.push(calculateSMA(smoothedKValues.slice(i, i + dPeriod).slice().reverse(), dPeriod));
+    }
+
+    if (smoothedKValues.length < 2 || dValues.length < 2) return null;
+
+    const currentK = smoothedKValues[smoothedKValues.length - 1];
+    const prevK = smoothedKValues[smoothedKValues.length - 2];
+    const currentD = dValues[dValues.length - 1];
+    const prevD = dValues[dValues.length - 1];
+
+    let overbought = 80; let oversold = 20;
+    if (volatility === "HIGH") { overbought = 88; oversold = 12; }
+    else if (volatility === "MEDIUM") { overbought = 82; oversold = 18;}
+    else if (volatility === "LOW") { overbought = 75; oversold = 25; }
+    else if (volatility === "VERY_LOW") { overbought = 70; oversold = 30; }
+
+
+    let prediction = null, strengthFactor = 0;
+    if (prevK <= prevD && currentK > currentD && currentK < overbought - 5) {
+         prediction = "BIG"; strengthFactor = Math.max(0.35, (oversold + 5 - Math.min(currentK, currentD, oversold + 5)) / (oversold + 5));
+    } else if (prevK >= prevD && currentK < currentD && currentK > oversold + 5) {
+        prediction = "SMALL"; strengthFactor = Math.max(0.35, (Math.max(currentK, currentD, overbought - 5) - (overbought - 5)) / (100 - (overbought - 5)));
+    }
+    if (!prediction) {
+        if (prevK < oversold && currentK >= oversold && currentK < (oversold + (overbought-oversold)/2) ) {
+            prediction = "BIG"; strengthFactor = Math.max(0.25, (currentK - oversold) / ((overbought-oversold)/2) );
+        } else if (prevK > overbought && currentK <= overbought && currentK > (oversold + (overbought-oversold)/2) ) {
+            prediction = "SMALL"; strengthFactor = Math.max(0.25, (overbought - currentK) / ((overbought-oversold)/2) );
+        }
+    }
+    if (prediction) return { prediction, weight: baseWeight * (0.5 + Math.min(strengthFactor, 1.0) * 0.5), source: "Stochastic" };
+    return null;
+}
+function analyzeVolatilityTrendFusion(trendContext, marketEntropyState, baseWeight) {
+    const { direction, strength, volatility } = trendContext;
+    const { state: entropy } = marketEntropyState;
+
+    let prediction = null;
+    let weightFactor = 0;
+
+    // High-conviction trend continuation
+    if (strength === 'STRONG' && (volatility === 'LOW' || volatility === 'MEDIUM') && entropy === 'ORDERLY') {
+        prediction = direction.includes('BIG') ? 'BIG' : 'SMALL';
+        weightFactor = 1.4;
+    }
+    // Trend exhaustion / reversal signal
+    else if (strength === 'STRONG' && volatility === 'HIGH' && entropy.includes('CHAOS')) {
+        prediction = direction.includes('BIG') ? 'SMALL' : 'BIG';
+        weightFactor = 1.2;
+    }
+    // Ranging market mean reversion
+    else if (strength === 'RANGING' && volatility === 'LOW' && entropy === 'ORDERLY') {
+        prediction = Math.random() > 0.5 ? 'BIG' : 'SMALL'; // Less certain
+        weightFactor = 0.8;
+    }
+
+    if (prediction) {
+        return { prediction, weight: baseWeight * weightFactor, source: 'Vol-Trend-Fusion' };
+    }
+    return null;
+}
+
+
+/**
+ * **FIXED in v44.1.0: Reverted to Simulation**
+ * Simulates a general-purpose ML model.
+ */
+function analyzeMLModelSignal_Standard(features, baseWeight) {
+    if (!features) return null;
+    const { rsi_14, macd_hist, stddev_30, trend_strength } = features;
+
+    let modelConfidence = 0;
+    let prediction = null;
+
+    if (rsi_14 > 70 && macd_hist < -0.1 && trend_strength < 2) {
+        prediction = "SMALL";
+        modelConfidence = Math.abs(macd_hist) + (rsi_14 - 70) / 30;
+    } else if (rsi_14 < 30 && macd_hist > 0.1 && trend_strength < 2) {
+        prediction = "BIG";
+        modelConfidence = Math.abs(macd_hist) + (30 - rsi_14) / 30;
+    } else if (trend_strength > 0 && macd_hist > 0.2) {
+        prediction = "BIG";
+        modelConfidence = 0.5 + trend_strength * 0.2;
+    }
+
+    if (prediction) {
+        const weight = baseWeight * Math.min(1.0, modelConfidence) * 1.5;
+        return { prediction, weight: weight, source: "ML-Standard" };
+    }
+    return null;
+}
+
+/**
+ * **FIXED in v44.1.0: Reverted to Simulation**
+ * Simulates an ML model trained specifically for volatile, non-trending markets.
+ */
+function analyzeMLModelSignal_Volatile(features, baseWeight) {
+    if (!features) return null;
+    const { rsi_14, stddev_30, last_5_mean, last_20_mean } = features;
+
+    let modelConfidence = 0;
+    let prediction = null;
+
+    // In high volatility, look for extreme RSI for mean reversion
+    if (stddev_30 > 2.5) {
+        if (rsi_14 > 80 && last_5_mean > last_20_mean) {
+            prediction = "SMALL";
+            modelConfidence = (rsi_14 - 80) / 20;
+        } else if (rsi_14 < 20 && last_5_mean < last_20_mean) {
+            prediction = "BIG";
+            modelConfidence = (20 - rsi_14) / 20;
+        }
+    }
+
+    if (prediction) {
+        const weight = baseWeight * Math.min(1.0, modelConfidence) * 1.7; // Higher importance for specialist model
+        return { prediction, weight: weight, source: "ML-Volatile" };
+    }
+    return null;
+}
+
+
+
+// --- Trend Stability & Market Entropy ---
+function analyzeTrendStability(history) {
+    if (!Array.isArray(history) || history.length < 25) {
+        return { isStable: true, reason: "Not enough data for stability check.", details: "", dominance: "NONE" };
+    }
+    const confirmedHistory = history.filter(p => p && (p.status === "Win" || p.status === "Loss") && typeof p.actual !== 'undefined' && p.actual !== null);
+    if (confirmedHistory.length < 20) return { isStable: true, reason: "Not enough confirmed results.", details: `Confirmed: ${confirmedHistory.length}`, dominance: "NONE" };
+
+    const recentResults = confirmedHistory.slice(0, 20).map(p => getBigSmallFromNumber(p.actual)).filter(r => r);
+    if (recentResults.length < 18) return { isStable: true, reason: "Not enough valid B/S for stability.", details: `Valid B/S: ${recentResults.length}`, dominance: "NONE" };
+
+    const bigCount = recentResults.filter(r => r === "BIG").length;
+    const smallCount = recentResults.filter(r => r === "SMALL").length;
+    let outcomeDominance = "NONE";
+
+    if (bigCount / recentResults.length >= 0.80) {
+        outcomeDominance = "BIG_DOMINANCE";
+        return { isStable: false, reason: "Unstable: Extreme Outcome Dominance", details: `BIG:${bigCount}, SMALL:${smallCount} in last ${recentResults.length}`, dominance: outcomeDominance };
+    }
+    if (smallCount / recentResults.length >= 0.80) {
+        outcomeDominance = "SMALL_DOMINANCE";
+        return { isStable: false, reason: "Unstable: Extreme Outcome Dominance", details: `BIG:${bigCount}, SMALL:${smallCount} in last ${recentResults.length}`, dominance: outcomeDominance };
+    }
+
+    const entropy = calculateEntropyForSignal(recentResults, recentResults.length);
+    if (entropy !== null && entropy < 0.45) {
+        return { isStable: false, reason: "Unstable: Very Low Entropy (Highly Predictable/Stuck)", details: `Entropy: ${entropy.toFixed(2)}`, dominance: outcomeDominance };
+    }
+
+    const actualNumbersRecent = confirmedHistory.slice(0, 15).map(p => parseInt(p.actualNumber || p.actual)).filter(n => !isNaN(n));
+    if (actualNumbersRecent.length >= 10) {
+        const stdDevNum = calculateStdDev(actualNumbersRecent, actualNumbersRecent.length);
+        if (stdDevNum !== null && stdDevNum > 3.3) {
+            return { isStable: false, reason: "Unstable: High Numerical Volatility", details: `StdDev: ${stdDevNum.toFixed(2)}`, dominance: outcomeDominance };
+        }
+    }
+    let alternations = 0;
+    for (let i = 0; i < recentResults.length - 1; i++) {
+        if (recentResults[i] !== recentResults[i + 1]) alternations++;
+    }
+    if (alternations / recentResults.length > 0.75) {
+        return { isStable: false, reason: "Unstable: Excessive Choppiness", details: `Alternations: ${alternations}/${recentResults.length}`, dominance: outcomeDominance };
+    }
+
+    return { isStable: true, reason: "Trend appears stable.", details: `Entropy: ${entropy !== null ? entropy.toFixed(2) : 'N/A'}`, dominance: outcomeDominance };
+}
+
 function analyzeMarketEntropyState(history, trendContext, stability) {
     const ENTROPY_WINDOW_SHORT = 10;
     const ENTROPY_WINDOW_LONG = 25;
-    const VOL_CHANGE_THRESHOLD = 0.3;
+    const VOL_CHANGE_THRESHOLD = 0.3; 
+
     if (history.length < ENTROPY_WINDOW_LONG) return { state: "UNCERTAIN_ENTROPY", details: "Insufficient history for entropy state." };
-    const outcomesShort = history.slice(0, ENTROPY_WINDOW_SHORT).map(e => getBigSmallType(e.actual));
-    const outcomesLong = history.slice(0, ENTROPY_WINDOW_LONG).map(e => getBigSmallType(e.actual));
+
+    const outcomesShort = history.slice(0, ENTROPY_WINDOW_SHORT).map(e => getBigSmallFromNumber(e.actual));
+    const outcomesLong = history.slice(0, ENTROPY_WINDOW_LONG).map(e => getBigSmallFromNumber(e.actual));
+
     const entropyShort = calculateEntropyForSignal(outcomesShort, ENTROPY_WINDOW_SHORT);
     const entropyLong = calculateEntropyForSignal(outcomesLong, ENTROPY_WINDOW_LONG);
-    const numbersShort = history.slice(0, ENTROPY_WINDOW_SHORT).map(e => parseInt(e.actual)).filter(n => !isNaN(n));
-    const numbersLongPrev = history.slice(ENTROPY_WINDOW_SHORT, ENTROPY_WINDOW_SHORT + ENTROPY_WINDOW_SHORT).map(e => parseInt(e.actual)).filter(n => !isNaN(n));
+
+    const numbersShort = history.slice(0, ENTROPY_WINDOW_SHORT).map(e => parseInt(e.actualNumber || e.actual)).filter(n => !isNaN(n));
+    const numbersLongPrev = history.slice(ENTROPY_WINDOW_SHORT, ENTROPY_WINDOW_SHORT + ENTROPY_WINDOW_SHORT).map(e => parseInt(e.actualNumber || e.actual)).filter(n => !isNaN(n));
+
     let shortTermVolatility = null, prevShortTermVolatility = null;
     if(numbersShort.length >= ENTROPY_WINDOW_SHORT * 0.8) shortTermVolatility = calculateStdDev(numbersShort, numbersShort.length);
     if(numbersLongPrev.length >= ENTROPY_WINDOW_SHORT * 0.8) prevShortTermVolatility = calculateStdDev(numbersLongPrev, numbersLongPrev.length);
-    let state = "STABLE_MODERATE";
+
+
+    let state = "STABLE_MODERATE"; 
     let details = `E_S:${entropyShort?.toFixed(2)} E_L:${entropyLong?.toFixed(2)} Vol_S:${shortTermVolatility?.toFixed(2)} Vol_P:${prevShortTermVolatility?.toFixed(2)}`;
+
     if (entropyShort === null || entropyLong === null) return { state: "UNCERTAIN_ENTROPY", details };
+
     if (entropyShort < 0.5 && entropyLong < 0.6 && shortTermVolatility !== null && shortTermVolatility < 1.5) {
         state = "ORDERLY";
     }
@@ -792,6 +836,7 @@ function analyzeMarketEntropyState(history, trendContext, stability) {
             state = "SUBSIDING_CHAOS";
         }
     }
+
     if (!stability.isStable && (state === "ORDERLY" || state === "STABLE_MODERATE")) {
         state = "POTENTIAL_CHAOS_FROM_INSTABILITY";
         details += ` | StabilityOverride: ${stability.reason}`;
@@ -799,89 +844,113 @@ function analyzeMarketEntropyState(history, trendContext, stability) {
     return { state, details };
 }
 
-function analyzeTrendStability(history) {
-    if (!Array.isArray(history) || history.length < 25) {
-        return { isStable: true, reason: "Not enough data for stability check.", details: "", dominance: "NONE" };
-    }
-    const confirmedHistory = history.filter(p => p && (p.status === "win" || p.status === "loss") && typeof p.actual !== 'undefined' && p.actual !== null);
-    if (confirmedHistory.length < 20) return { isStable: true, reason: "Not enough confirmed results.", details: `Confirmed: ${confirmedHistory.length}`, dominance: "NONE" };
-    const recentResults = confirmedHistory.slice(0, 20).map(p => getBigSmallType(p.actual)).filter(r => r);
-    if (recentResults.length < 18) return { isStable: true, reason: "Not enough valid B/S for stability.", details: `Valid B/S: ${recentResults.length}`, dominance: "NONE" };
-    const bigCount = recentResults.filter(r => r === "BIG").length;
-    const smallCount = recentResults.filter(r => r === "SMALL").length;
-    let outcomeDominance = "NONE";
-    if (bigCount / recentResults.length >= 0.85) {
-        outcomeDominance = "BIG_DOMINANCE";
-        return { isStable: false, reason: "Unstable: Extreme Outcome Dominance", details: `BIG:${bigCount}, SMALL:${smallCount} in last ${recentResults.length}`, dominance: outcomeDominance };
-    }
-    if (smallCount / recentResults.length >= 0.85) {
-        outcomeDominance = "SMALL_DOMINANCE";
-        return { isStable: false, reason: "Unstable: Extreme Outcome Dominance", details: `BIG:${bigCount}, SMALL:${smallCount} in last ${recentResults.length}`, dominance: outcomeDominance };
-    }
-    const entropy = calculateEntropyForSignal(recentResults, recentResults.length);
-    if (entropy !== null && entropy < 0.40) {
-        return { isStable: false, reason: "Unstable: Very Low Entropy (Highly Predictable/Stuck)", details: `Entropy: ${entropy.toFixed(2)}`, dominance: outcomeDominance };
-    }
-    const actualNumbersRecent = confirmedHistory.slice(0, 15).map(p => parseInt(p.actual)).filter(n => !isNaN(n));
-    if (actualNumbersRecent.length >= 10) {
-        const stdDevNum = calculateStdDev(actualNumbersRecent, actualNumbersRecent.length);
-        if (stdDevNum !== null && stdDevNum > 3.4) {
-            return { isStable: false, reason: "Unstable: High Numerical Volatility", details: `StdDev: ${stdDevNum.toFixed(2)}`, dominance: outcomeDominance };
-        }
-    }
-    let alternations = 0;
-    for (let i = 0; i < recentResults.length - 1; i++) {
-        if (recentResults[i] !== recentResults[i + 1]) alternations++;
-    }
-    if (alternations / (recentResults.length - 1) > 0.80) {
-        return { isStable: false, reason: "Unstable: Excessive Choppiness", details: `Alternations: ${alternations}/${recentResults.length}`, dominance: outcomeDominance };
-    }
-    return { isStable: true, reason: "Trend appears stable.", details: `Entropy: ${entropy !== null ? entropy.toFixed(2) : 'N/A'}`, dominance: outcomeDominance };
-}
-
-function analyzeVolatilityTrendFusion(trendContext, marketEntropyState) {
-    const { direction, strength, volatility } = trendContext;
+function analyzeAdvancedMarketRegime(trendContext, marketEntropyState) {
+    const { strength, volatility } = trendContext;
     const { state: entropy } = marketEntropyState;
-    let prediction = null;
-    let confidence = 0;
-    if (strength === 'STRONG' && (volatility === 'LOW' || volatility === 'MEDIUM') && entropy === 'ORDERLY') {
-        prediction = direction.includes('BIG') ? 'BIG' : 'SMALL';
-        confidence = 80;
+
+    let probabilities = {
+        bullTrend: 0.25,
+        bearTrend: 0.25,
+        volatileRange: 0.25,
+        quietRange: 0.25
+    };
+
+    if (strength === 'STRONG' && volatility !== 'HIGH' && entropy === 'ORDERLY') {
+        if (trendContext.direction.includes('BIG')) {
+            probabilities = { bullTrend: 0.8, bearTrend: 0.05, volatileRange: 0.1, quietRange: 0.05 };
+        } else {
+            probabilities = { bullTrend: 0.05, bearTrend: 0.8, volatileRange: 0.1, quietRange: 0.05 };
+        }
+    } else if (strength === 'RANGING' && volatility === 'HIGH' && entropy.includes('CHAOS')) {
+         probabilities = { bullTrend: 0.1, bearTrend: 0.1, volatileRange: 0.7, quietRange: 0.1 };
+    } else if (strength === 'RANGING' && volatility === 'VERY_LOW') {
+         probabilities = { bullTrend: 0.1, bearTrend: 0.1, volatileRange: 0.1, quietRange: 0.7 };
     }
-    else if (strength === 'STRONG' && volatility === 'HIGH' && entropy.includes('CHAOS')) {
-        prediction = direction.includes('BIG') ? 'SMALL' : 'BIG';
-        confidence = 70;
-    }
-    else if (strength === 'RANGING' && volatility === 'LOW' && entropy === 'ORDERLY') {
-        const currentHour = getCurrentISTHour().raw;
-        prediction = (currentHour % 2 === 0) ? 'BIG' : 'SMALL';
-        confidence = 60;
-    }
-    if (prediction) {
-        return { prediction, confidence };
-    }
-    return null;
+
+    return { probabilities, details: `Prob(B:${probabilities.bullTrend.toFixed(2)},S:${probabilities.bearTrend.toFixed(2)})` };
 }
 
-// --- Dynamic Weighting, Performance Tracking & Meta-Learning ---
-function updateSignalPerformance(actualOutcome, predictedOutcome, periodFull, currentVolatilityRegime, lastFinalConfidence, concentrationModeActive, marketEntropyState, macroRegime) {
-    if (!actualOutcome || !predictedOutcome) return;
-    const isSystemPredictionCorrect = (predictedOutcome === actualOutcome);
-    const isHighConfidencePrediction = lastFinalConfidence > 75;
-    const currentRegimeProfile = REGIME_SIGNAL_PROFILES[macroRegime] || REGIME_SIGNAL_PROFILES["DEFAULT"];
-    const allPossibleSignalSources = Object.keys(defaultHeuristicPerformance);
-    allPossibleSignalSources.forEach(source => {
-        let signalType = 'other';
-        if (source.includes('_LHT')) signalType = source.split('_')[0].toLowerCase();
-        else if (source.includes('_TX')) signalType = source.split('-')[0].toLowerCase();
-        if (source.includes('Ichimoku')) signalType = 'ichimoku';
-        if (source.includes('Vol-Trend-Fusion')) signalType = 'fusion';
-        if (source.includes('RSI')) signalType = 'rsi';
-        if (source.includes('Stochastic')) signalType = 'stochastic';
-        const isActiveForRegime = currentRegimeProfile.activeSignalTypes.includes('all') || currentRegimeProfile.activeSignalTypes.includes(signalType);
-        if (!isActiveForRegime) {
-            return;
+
+// --- Signal & Regime Performance Learning ---
+let signalPerformance = {};
+const PERFORMANCE_WINDOW = 30;
+const SESSION_PERFORMANCE_WINDOW = 15;
+const MIN_OBSERVATIONS_FOR_ADJUST = 10;
+const MAX_WEIGHT_FACTOR = 1.95;
+const MIN_WEIGHT_FACTOR = 0.05;
+const MAX_ALPHA_FACTOR = 1.6;
+const MIN_ALPHA_FACTOR = 0.4;
+const MIN_ABSOLUTE_WEIGHT = 0.0003;
+const INACTIVITY_PERIOD_FOR_DECAY = PERFORMANCE_WINDOW * 3;
+const DECAY_RATE = 0.025;
+const ALPHA_UPDATE_RATE = 0.04;
+const PROBATION_THRESHOLD_ACCURACY = 0.40;
+const PROBATION_MIN_OBSERVATIONS = 15;
+const PROBATION_WEIGHT_CAP = 0.10;
+let driftDetector = { p_min: Infinity, s_min: Infinity, n: 0, warning_level: 2.0, drift_level: 3.0 };
+
+function getDynamicWeightAdjustment(signalSourceName, baseWeight, currentPeriodFull, currentVolatilityRegime, sessionHistory) {
+    const perf = signalPerformance[signalSourceName];
+    if (!perf) {
+        signalPerformance[signalSourceName] = {
+            correct: 0, total: 0, recentAccuracy: [],
+            sessionCorrect: 0, sessionTotal: 0,
+            lastUpdatePeriod: null, lastActivePeriod: null,
+            currentAdjustmentFactor: 1.0, alphaFactor: 1.0, longTermImportanceScore: 0.5,
+            performanceByVolatility: {}, isOnProbation: false
+        };
+        return Math.max(baseWeight, MIN_ABSOLUTE_WEIGHT);
+    }
+
+    if (sessionHistory.length <= 1) {
+        perf.sessionCorrect = 0;
+        perf.sessionTotal = 0;
+    }
+
+    if (perf.lastUpdatePeriod !== currentPeriodFull) {
+        if (perf.lastActivePeriod !== null && (currentPeriodFull - perf.lastActivePeriod) > INACTIVITY_PERIOD_FOR_DECAY) {
+            if (perf.currentAdjustmentFactor > 1.0) perf.currentAdjustmentFactor = Math.max(1.0, perf.currentAdjustmentFactor - DECAY_RATE);
+            else if (perf.currentAdjustmentFactor < 1.0) perf.currentAdjustmentFactor = Math.min(1.0, perf.currentAdjustmentFactor + DECAY_RATE);
+            if (perf.isOnProbation) perf.isOnProbation = false;
         }
+        perf.lastUpdatePeriod = currentPeriodFull;
+    }
+
+    let volatilitySpecificAdjustment = 1.0;
+    if (perf.performanceByVolatility[currentVolatilityRegime] && perf.performanceByVolatility[currentVolatilityRegime].total >= MIN_OBSERVATIONS_FOR_ADJUST / 2.0) {
+        const volPerf = perf.performanceByVolatility[currentVolatilityRegime];
+        const volAccuracy = volPerf.correct / volPerf.total;
+        const volDeviation = volAccuracy - 0.5;
+        volatilitySpecificAdjustment = 1 + (volDeviation * 1.30);
+        volatilitySpecificAdjustment = Math.min(Math.max(volatilitySpecificAdjustment, 0.55), 1.45);
+    }
+
+    let sessionAdjustmentFactor = 1.0;
+    if (perf.sessionTotal >= 3) {
+        const sessionAccuracy = perf.sessionCorrect / perf.sessionTotal;
+        const sessionDeviation = sessionAccuracy - 0.5;
+        sessionAdjustmentFactor = 1 + (sessionDeviation * 1.5);
+        sessionAdjustmentFactor = Math.min(Math.max(sessionAdjustmentFactor, 0.6), 1.4);
+    }
+
+    let finalAdjustmentFactor = perf.currentAdjustmentFactor * perf.alphaFactor * volatilitySpecificAdjustment * sessionAdjustmentFactor * (0.70 + perf.longTermImportanceScore * 0.6);
+
+    if (perf.isOnProbation) {
+        finalAdjustmentFactor = Math.min(finalAdjustmentFactor, PROBATION_WEIGHT_CAP);
+    }
+
+    let adjustedWeight = baseWeight * finalAdjustmentFactor;
+    return Math.max(adjustedWeight, MIN_ABSOLUTE_WEIGHT);
+}
+
+function updateSignalPerformance(contributingSignals, actualOutcome, periodFull, currentVolatilityRegime, lastFinalConfidence, concentrationModeActive, marketEntropyState) {
+    if (!actualOutcome || !contributingSignals || contributingSignals.length === 0) return;
+    const isHighConfidencePrediction = lastFinalConfidence > 0.75;
+    const isOverallCorrect = getBigSmallFromNumber(actualOutcome) === (lastFinalConfidence > 0.5 ? "BIG" : "SMALL");
+
+    contributingSignals.forEach(signal => {
+        if (!signal || !signal.source) return;
+        const source = signal.source;
         if (!signalPerformance[source]) {
             signalPerformance[source] = {
                 correct: 0, total: 0, recentAccuracy: [],
@@ -891,110 +960,137 @@ function updateSignalPerformance(actualOutcome, predictedOutcome, periodFull, cu
                 performanceByVolatility: {}, isOnProbation: false
             };
         }
+
         if (!signalPerformance[source].performanceByVolatility[currentVolatilityRegime]) {
             signalPerformance[source].performanceByVolatility[currentVolatilityRegime] = { correct: 0, total: 0 };
         }
-        if (signalPerformance[source].lastUpdatePeriod !== periodFull) {
+
+        if (signalPerformance[source].lastActivePeriod !== periodFull || signalPerformance[source].total === 0) {
             signalPerformance[source].total++;
             signalPerformance[source].sessionTotal++;
             signalPerformance[source].performanceByVolatility[currentVolatilityRegime].total++;
-            let outcomeCorrect = isSystemPredictionCorrect ? 1 : 0;
+            let outcomeCorrect = (signal.prediction === actualOutcome) ? 1 : 0;
             if (outcomeCorrect) {
                 signalPerformance[source].correct++;
                 signalPerformance[source].sessionCorrect++;
                 signalPerformance[source].performanceByVolatility[currentVolatilityRegime].correct++;
             }
+
             let importanceDelta = 0;
             if(outcomeCorrect) {
-                importanceDelta = isHighConfidencePrediction ? 0.05 : 0.025;
+                importanceDelta = isHighConfidencePrediction ? 0.025 : 0.01;
             } else {
-                importanceDelta = isHighConfidencePrediction ? -0.07 : -0.04;
+                importanceDelta = isHighConfidencePrediction && !isOverallCorrect ? -0.040 : -0.015;
             }
+
             if (concentrationModeActive || marketEntropyState.includes("CHAOS")) {
-                importanceDelta *= 1.5;
+                 importanceDelta *= 1.5;
             }
             signalPerformance[source].longTermImportanceScore = Math.min(1.0, Math.max(0.0, signalPerformance[source].longTermImportanceScore + importanceDelta));
+
             signalPerformance[source].recentAccuracy.push(outcomeCorrect);
             if (signalPerformance[source].recentAccuracy.length > PERFORMANCE_WINDOW) {
                 signalPerformance[source].recentAccuracy.shift();
             }
+
             if (signalPerformance[source].total >= MIN_OBSERVATIONS_FOR_ADJUST && signalPerformance[source].recentAccuracy.length >= PERFORMANCE_WINDOW / 2) {
                 const recentCorrectCount = signalPerformance[source].recentAccuracy.reduce((sum, acc) => sum + acc, 0);
                 const accuracy = recentCorrectCount / signalPerformance[source].recentAccuracy.length;
                 const deviation = accuracy - 0.5;
-                let newAdjustmentFactor = 1 + (deviation * 5.0);
+                let newAdjustmentFactor = 1 + (deviation * 3.5);
                 newAdjustmentFactor = Math.min(Math.max(newAdjustmentFactor, MIN_WEIGHT_FACTOR), MAX_WEIGHT_FACTOR);
                 signalPerformance[source].currentAdjustmentFactor = newAdjustmentFactor;
+
                 if (signalPerformance[source].recentAccuracy.length >= PROBATION_MIN_OBSERVATIONS && accuracy < PROBATION_THRESHOLD_ACCURACY) {
                     signalPerformance[source].isOnProbation = true;
                 } else if (accuracy > PROBATION_THRESHOLD_ACCURACY + 0.15) {
                     signalPerformance[source].isOnProbation = false;
                 }
-                let alphaLearningRate = ALPHA_UPDATE_RATE * 1.2;
-                if (accuracy < 0.35) alphaLearningRate *= 1.8;
-                else if (accuracy < 0.45) alphaLearningRate *= 1.5;
+
+
+                let alphaLearningRate = ALPHA_UPDATE_RATE;
+                if (accuracy < 0.35) alphaLearningRate *= 1.75;
+                else if (accuracy < 0.45) alphaLearningRate *= 1.4;
+
                 if (newAdjustmentFactor > signalPerformance[source].alphaFactor) {
                     signalPerformance[source].alphaFactor = Math.min(MAX_ALPHA_FACTOR, signalPerformance[source].alphaFactor + alphaLearningRate * (newAdjustmentFactor - signalPerformance[source].alphaFactor));
                 } else {
                     signalPerformance[source].alphaFactor = Math.max(MIN_ALPHA_FACTOR, signalPerformance[source].alphaFactor - alphaLearningRate * (signalPerformance[source].alphaFactor - newAdjustmentFactor));
                 }
             }
-            signalPerformance[source].lastUpdatePeriod = periodFull;
             signalPerformance[source].lastActivePeriod = periodFull;
         }
+        signalPerformance[source].lastUpdatePeriod = periodFull;
     });
 }
 
-function updateQLearningState(history, lastPredictedOutcome, actualOutcome) {
-    const outcomes = history.map(p => getBigSmallType(p.actual)).filter(Boolean);
-    if (outcomes.length < 5) return;
-    const prevState = outcomes.slice(1, 5).join('-');
-    const currentAction = lastPredictedOutcome;
-    const newState = outcomes.slice(0, 4).join('-');
-    const reward = (actualOutcome === lastPredictedOutcome) ? Q_REWARD_WIN : Q_REWARD_LOSS;
-    if (!qTable[prevState]) {
-        qTable[prevState] = { BIG: 0, SMALL: 0 };
-    }
-    if (!qTable[newState]) {
-        qTable[newState] = { BIG: 0, SMALL: 0 };
-    }
-    const currentQ = qTable[prevState][currentAction] || 0;
-    const maxNextQ = Math.max(qTable[newState].BIG || 0, qTable[newState].SMALL || 0);
-    const target = reward + Q_DISCOUNT_FACTOR * maxNextQ;
-    const delta = target - currentQ;
-    qTable[prevState][currentAction] = currentQ + Q_LEARNING_RATE * delta;
-    const stateTotal = Math.abs(qTable[prevState].BIG) + Math.abs(qTable[prevState].SMALL);
-    if (stateTotal > 0) {
-        qTable[prevState].BIG /= stateTotal;
-        qTable[prevState].SMALL /= stateTotal;
-    }
-}
-
 function detectConceptDrift(isCorrect) {
-    const error = isCorrect ? 0 : 1;
-    driftDetector.recentErrors.push(error);
-    if (driftDetector.recentErrors.length > 50) {
-        driftDetector.recentErrors.shift();
+    driftDetector.n++;
+    const errorRate = isCorrect ? 0 : 1;
+    const p_i = (driftDetector.n > 1 ? driftDetector.p_i : 0) + (errorRate - (driftDetector.n > 1 ? driftDetector.p_i : 0)) / driftDetector.n;
+    driftDetector.p_i = p_i;
+    const s_i = Math.sqrt(p_i * (1 - p_i) / driftDetector.n);
+
+    if (p_i + s_i < driftDetector.p_min + driftDetector.s_min) {
+        driftDetector.p_min = p_i;
+        driftDetector.s_min = s_i;
     }
-    if (driftDetector.recentErrors.length === 0) {
-        return 'STABLE';
-    }
-    if (driftDetector.ewma === 0.5 && driftDetector.recentErrors.length > 0) {
-        const initialSum = driftDetector.recentErrors.reduce((a, b) => a + b, 0);
-        driftDetector.ewma = initialSum / driftDetector.recentErrors.length;
-    } else {
-        driftDetector.ewma = (driftDetector.lambda * error) + (1 - driftDetector.lambda) * driftDetector.ewma;
-    }
-    const deviation = Math.abs(driftDetector.ewma - driftDetector.baselineError);
-    if (deviation > driftDetector.driftThreshold) {
-        driftDetector.ewma = driftDetector.baselineError;
+
+    if (p_i + s_i > driftDetector.p_min + driftDetector.drift_level * driftDetector.s_min) {
+        driftDetector.p_min = Infinity;
+        driftDetector.s_min = Infinity;
+        driftDetector.n = 1;
         return 'DRIFT';
-    } else if (deviation > driftDetector.warningThreshold) {
+    } else if (p_i + s_i > driftDetector.p_min + driftDetector.warning_level * driftDetector.s_min) {
         return 'WARNING';
     } else {
         return 'STABLE';
     }
 }
+
+
+let REGIME_SIGNAL_PROFILES = {
+    "TREND_STRONG_LOW_VOL": { baseWeightMultiplier: 1.30, activeSignalTypes: ['trend', 'momentum', 'ichimoku', 'volBreak', 'fusion', 'ml_standard'], contextualAggression: 1.35, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
+    "TREND_STRONG_MED_VOL": { baseWeightMultiplier: 1.20, activeSignalTypes: ['trend', 'momentum', 'ichimoku', 'pattern', 'fusion', 'ml_standard'], contextualAggression: 1.25, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
+    "TREND_STRONG_HIGH_VOL": { baseWeightMultiplier: 0.70, activeSignalTypes: ['trend', 'ichimoku', 'entropy', 'volPersist', 'fusion', 'ml_volatile'], contextualAggression: 0.70, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
+    "RANGE_LOW_VOL": { baseWeightMultiplier: 1.30, activeSignalTypes: ['meanRev', 'pattern', 'volBreak', 'stochastic', 'bollinger'], contextualAggression: 1.30, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
+    "RANGE_MED_VOL": { baseWeightMultiplier: 1.15, activeSignalTypes: ['meanRev', 'pattern', 'stochastic', 'rsi', 'bollinger'], contextualAggression: 1.15, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
+    "RANGE_HIGH_VOL": { baseWeightMultiplier: 0.85, activeSignalTypes: ['meanRev', 'entropy', 'bollinger', 'volPersist', 'fusion', 'ml_volatile'], contextualAggression: 0.85, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 },
+    "DEFAULT": { baseWeightMultiplier: 0.9, activeSignalTypes: ['all'], contextualAggression: 0.9, recentAccuracy: [], totalPredictions: 0, correctPredictions: 0 }
+};
+const REGIME_ACCURACY_WINDOW = 35;
+const REGIME_LEARNING_RATE_BASE = 0.028;
+let GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE = 0.5;
+
+/**
+ * **NEW in v43.0.0: Dynamic Regime Discovery (Simulation)**
+ * Simulates identifying a new, persistent market state and creating a strategy for it.
+ */
+function discoverAndAdaptRegimes(history, trendContext, stability, sharedStats) {
+    const CHOPPY_PERSISTENCE_THRESHOLD = 8; 
+    const aurochsState = sharedStats.aurochsState || { choppyCount: 0 };
+
+    if (trendContext.volatility === "VERY_LOW" && stability.reason.includes("Choppiness")) {
+        aurochsState.choppyCount++;
+    } else {
+        aurochsState.choppyCount = 0;
+    }
+
+    if (aurochsState.choppyCount >= CHOPPY_PERSISTENCE_THRESHOLD && !REGIME_SIGNAL_PROFILES["CUSTOM_AUROCHS_MODE"]) {
+        console.log("!!! DYNAMIC REGIME DISCOVERY: New 'AUROCHS' mode identified. Creating profile. !!!");
+        REGIME_SIGNAL_PROFILES["CUSTOM_AUROCHS_MODE"] = {
+            baseWeightMultiplier: 1.40,
+            activeSignalTypes: ['pattern', 'meanRev', 'stochastic', 'bollinger'], 
+            contextualAggression: 1.50, 
+            recentAccuracy: [],
+            totalPredictions: 0,
+            correctPredictions: 0
+        };
+    }
+
+    return aurochsState; // Return the updated state
+}
+
 
 function updateRegimeProfilePerformance(regime, actualOutcome, predictedOutcome) {
     if (REGIME_SIGNAL_PROFILES[regime] && predictedOutcome) {
@@ -1002,16 +1098,19 @@ function updateRegimeProfilePerformance(regime, actualOutcome, predictedOutcome)
         profile.totalPredictions = (profile.totalPredictions || 0) + 1;
         let outcomeCorrect = (actualOutcome === predictedOutcome) ? 1 : 0;
         if(outcomeCorrect === 1) profile.correctPredictions = (profile.correctPredictions || 0) + 1;
+
         profile.recentAccuracy.push(outcomeCorrect);
         if (profile.recentAccuracy.length > REGIME_ACCURACY_WINDOW) {
             profile.recentAccuracy.shift();
         }
+
         if (profile.recentAccuracy.length >= REGIME_ACCURACY_WINDOW * 0.7) {
             const regimeAcc = profile.recentAccuracy.reduce((a,b) => a+b, 0) / profile.recentAccuracy.length;
             let dynamicLearningRateFactor = 1.0 + Math.abs(0.5 - GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE) * 0.7;
             dynamicLearningRateFactor = Math.max(0.65, Math.min(1.5, dynamicLearningRateFactor));
             let currentLearningRate = REGIME_LEARNING_RATE_BASE * dynamicLearningRateFactor;
             currentLearningRate = Math.max(0.01, Math.min(0.07, currentLearningRate));
+
             if (regimeAcc > 0.62) {
                 profile.baseWeightMultiplier = Math.min(1.9, profile.baseWeightMultiplier + currentLearningRate);
                 profile.contextualAggression = Math.min(1.8, profile.contextualAggression + currentLearningRate * 0.5);
@@ -1023,534 +1122,520 @@ function updateRegimeProfilePerformance(regime, actualOutcome, predictedOutcome)
     }
 }
 
-function analyzeSignalConsistency(signals) {
+
+function analyzePredictionConsensus(signals, trendContext) {
+    if (!signals || signals.length < 4) {
+        return { score: 0.5, factor: 1.0, details: "Insufficient signals for consensus" };
+    }
+
+    const categories = {
+        trend: { BIG: 0, SMALL: 0, weight: 0 },
+        momentum: { BIG: 0, SMALL: 0, weight: 0 },
+        meanRev: { BIG: 0, SMALL: 0, weight: 0 },
+        pattern: { BIG: 0, SMALL: 0, weight: 0 },
+        ml: { BIG: 0, SMALL: 0, weight: 0 }
+    };
+
+    const getCategory = source => {
+        if (source.includes("MACD") || source.includes("Ichimoku") || source.includes("Fusion")) return 'trend';
+        if (source.includes("Stochastic") || source.includes("RSI")) return 'momentum';
+        if (source.includes("Bollinger") || source.includes("Streak")) return 'meanRev';
+        if (source.includes("Alt") || source.includes("Pattern") || source.includes("Transition")) return 'pattern';
+        if (source.includes("ML-")) return 'ml';
+        return null;
+    };
+
+    signals.forEach(s => {
+        const category = getCategory(s.source);
+        if (category && (s.prediction === "BIG" || s.prediction === "SMALL")) {
+            categories[category][s.prediction] += s.adjustedWeight;
+        }
+    });
+
+    let bigWeight = 0, smallWeight = 0;
+    let bigCats = 0, smallCats = 0, mixedCats = 0;
+
+    for(const cat of Object.values(categories)) {
+        const totalWeight = cat.BIG + cat.SMALL;
+        if (totalWeight > 0.001) {
+            bigWeight += cat.BIG;
+            smallWeight += cat.SMALL;
+            if(cat.BIG > cat.SMALL * 1.5) bigCats++; // Higher threshold for clear category win
+            else if (cat.SMALL > cat.BIG * 1.5) smallCats++;
+            else mixedCats++;
+        }
+    }
+
+    let consensusScore = 0.5;
+    const totalCats = bigCats + smallCats + mixedCats;
+    if(totalCats > 0) {
+        const dominantCats = Math.max(bigCats, smallCats);
+        const nonDominantCats = Math.min(bigCats, smallCats);
+        consensusScore = (dominantCats - nonDominantCats) / totalCats;
+    }
+
+    let factor = 1.0 + (consensusScore * 0.5);
+
+    if (trendContext.strength === 'STRONG') {
+        if((categories.trend.BIG > categories.trend.SMALL && categories.momentum.SMALL > categories.momentum.BIG) ||
+           (categories.trend.SMALL > categories.trend.BIG && categories.momentum.BIG > categories.momentum.SMALL)) {
+            factor *= 0.6; // Heavy penalty for trend/momentum conflict
+        }
+    }
+
+    return {
+        score: consensusScore,
+        factor: Math.max(0.4, Math.min(1.6, factor)),
+        details: `Bcat:${bigCats},Scat:${smallCats},Mcat:${mixedCats},Score:${consensusScore.toFixed(2)}`
+    };
+}
+
+
+/**
+ * **NEW in v43.0.0: Meta-Learning Confidence Model**
+ * Assesses the quality of the signal set to produce a final, adjusted confidence level.
+ */
+function analyzeConfidenceModel(preliminaryDecision, signals, consensus, driftState, pqs) {
+    let confidenceLevel = 1;
+    let confidenceReason = "Baseline";
+
+    const agreeingSignals = signals.filter(s => s.prediction === preliminaryDecision);
+    const disagreeingSignals = signals.filter(s => s.prediction && s.prediction !== preliminaryDecision);
+
+    const agreeingWeight = agreeingSignals.reduce((sum, s) => sum + s.adjustedWeight, 0);
+    const disagreeingWeight = disagreeingSignals.reduce((sum, s) => sum + s.adjustedWeight, 0);
+
+    const weightRatio = agreeingWeight / (disagreeingWeight + 0.01);
+
+    if (consensus.score > 0.6 && weightRatio > 2.5 && pqs > 0.6) {
+        confidenceLevel = 2;
+        confidenceReason = "Good Consensus & Weight Ratio";
+    }
+
+    if (consensus.score > 0.8 && weightRatio > 4.0 && pqs > 0.75 && driftState === 'STABLE') {
+        const mlSignal = signals.find(s => s.source.startsWith("ML-"));
+        if (mlSignal && mlSignal.prediction === preliminaryDecision) {
+            confidenceLevel = 3;
+            confidenceReason = "High-Conviction Consensus with ML Agreement";
+        }
+    }
+
+    // Overrides for high uncertainty
+    if (driftState === 'DRIFT' || pqs < 0.25) {
+        confidenceLevel = 1;
+        confidenceReason = "Override: High Uncertainty/Drift";
+    }
+
+    return { finalConfidenceLevel: confidenceLevel, reason: confidenceReason };
+}
+
+
+function analyzePathConfluenceStrength(signals, finalPrediction) {
+    if (!signals || signals.length === 0 || !finalPrediction) return { score: 0, diversePaths: 0, details: "No valid signals or prediction." };
+
+    const agreeingSignals = signals.filter(s => s.prediction === finalPrediction && s.adjustedWeight > MIN_ABSOLUTE_WEIGHT * 10);
+    if (agreeingSignals.length < 2) {
+        return { score: 0, diversePaths: agreeingSignals.length, details: "Insufficient agreeing signals." };
+    }
+
+    const signalCategories = new Set();
+    agreeingSignals.forEach(s => {
+        if (s.source.includes("MACD") || s.source.includes("Ichimoku")) signalCategories.add('trend');
+        else if (s.source.includes("Stochastic") || s.source.includes("RSI")) signalCategories.add('momentum');
+        else if (s.source.includes("Bollinger") || s.source.includes("ZScore")) signalCategories.add('meanRev');
+        else if (s.source.includes("Gram") || s.source.includes("Cycle") || s.source.includes("Pattern")) signalCategories.add('pattern');
+        else if (s.source.includes("Vol") || s.source.includes("FractalDim")) signalCategories.add('volatility');
+        else if (s.source.includes("Bayesian") || s.source.includes("Superposition") || s.source.includes("ML-")) signalCategories.add('probabilistic');
+        else signalCategories.add('other');
+    });
+
+    const diversePathCount = signalCategories.size;
+    let confluenceScore = 0;
+
+    if (diversePathCount >= 4) confluenceScore = 0.20;
+    else if (diversePathCount === 3) confluenceScore = 0.12;
+    else if (diversePathCount === 2) confluenceScore = 0.05;
+
+    const veryStrongAgreeingCount = agreeingSignals.filter(s => s.adjustedWeight > 0.10).length;
+    confluenceScore += Math.min(veryStrongAgreeingCount * 0.02, 0.10);
+
+    return { score: Math.min(confluenceScore, 0.30), diversePaths: diversePathCount, details: `Paths:${diversePathCount},Strong:${veryStrongAgreeingCount}` };
+}
+
+function analyzeSignalConsistency(signals, trendContext) {
     if (!signals || signals.length < 3) return { score: 0.70, details: "Too few signals for consistency check" };
     const validSignals = signals.filter(s => s.prediction);
     if (validSignals.length < 3) return { score: 0.70, details: "Too few valid signals" };
+
     const predictions = { BIG: 0, SMALL: 0 };
     validSignals.forEach(s => {
         if (s.prediction === "BIG" || s.prediction === "SMALL") predictions[s.prediction]++;
     });
+
     const totalPredictions = predictions.BIG + predictions.SMALL;
     if (totalPredictions === 0) return { score: 0.5, details: "No directional signals" };
+
     const consistencyScore = Math.max(predictions.BIG, predictions.SMALL) / totalPredictions;
     return { score: consistencyScore, details: `Overall split B:${predictions.BIG}/S:${predictions.SMALL}` };
 }
 
-function analyzePathConfluenceStrength(activeSignals, finalPrediction) {
-    if (!activeSignals || activeSignals.length === 0 || !finalPrediction) return { score: 0, diversePaths: 0, details: "No valid signals or prediction." };
-    const signalCategories = new Set();
-    activeSignals.forEach(s => {
-        const sourceName = s.source;
-        if (sourceName.includes("Ichimoku") || sourceName.includes("trend") || sourceName.includes("ARIMA")) signalCategories.add('trend');
-        else if (sourceName.includes("Stochastic") || sourceName.includes("RSI") || sourceName.includes("momentum")) signalCategories.add('momentum');
-        else if (sourceName.includes("balance") || sourceName.includes("deviation") || sourceName.includes("meanRev")) signalCategories.add('meanRev');
-        else if (sourceName.includes("Pattern") || sourceName.includes("oscillation") || sourceName.includes("microTrend")) signalCategories.add('pattern');
-        else if (sourceName.includes("Vol") || sourceName.includes("entropy") || sourceName.includes("Fusion")) signalCategories.add('volatility');
-        else if (sourceName.includes("Q-Learning") || sourceName.includes("Numerology") || sourceName.includes("Bayesian")) signalCategories.add('adaptive');
-        else signalCategories.add('other');
-    });
-    const diversePathCount = signalCategories.size;
-    let confluenceScore = 0;
-    if (diversePathCount >= 4) confluenceScore = 0.20;
-    else if (diversePathCount === 3) confluenceScore = 0.12;
-    else if (diversePathCount === 2) confluenceScore = 0.05;
-    return { score: Math.min(confluenceScore, 0.30), diversePaths: diversePathCount, details: `Paths:${diversePathCount}` };
-}
+let consecutiveHighConfLosses = 0;
+let reflexiveCorrectionActive = 0; 
 
 function checkForAnomalousPerformance(currentSharedStats) {
     if (reflexiveCorrectionActive > 0) {
         reflexiveCorrectionActive--;
         return true;
     }
-    if (currentSharedStats && typeof currentSharedStats.lastFinalConfidence === 'number' && currentSharedStats.lastActualOutcome !== null && typeof currentSharedStats.lastPredictedOutcome !== 'undefined') {
-        const lastActualType = getBigSmallType(currentSharedStats.lastActualOutcome);
-        const lastPredWasCorrect = lastActualType === currentSharedStats.lastPredictedOutcome;
+
+    if (currentSharedStats && typeof currentSharedStats.lastFinalConfidence === 'number' && currentSharedStats.lastActualOutcome) {
+        const lastPredOutcomeBS = getBigSmallFromNumber(currentSharedStats.lastActualOutcome);
+        const lastPredWasCorrect = lastPredOutcomeBS === currentSharedStats.lastPredictedOutcome;
+
         const lastPredWasHighConf = currentSharedStats.lastConfidenceLevel === 3;
+
         if (lastPredWasHighConf && !lastPredWasCorrect) {
             consecutiveHighConfLosses++;
         } else {
             consecutiveHighConfLosses = 0;
         }
     }
+
     if (consecutiveHighConfLosses >= 2) {
         reflexiveCorrectionActive = 5;
         consecutiveHighConfLosses = 0;
         return true;
     }
+
     return false;
 }
 
 function calculateUncertaintyScore(trendContext, stability, marketEntropyState, signalConsistency, pathConfluence, globalAccuracy, isReflexiveCorrection, driftState) {
     let uncertaintyScore = 0;
     let reasons = [];
+
     if (isReflexiveCorrection) {
-        uncertaintyScore += 65;
+        uncertaintyScore += 80;
         reasons.push("ReflexiveCorrection");
     }
     if(driftState === 'DRIFT') {
-        uncertaintyScore += 60;
+        uncertaintyScore += 70;
         reasons.push("ConceptDrift");
     } else if (driftState === 'WARNING') {
-        uncertaintyScore += 30;
+        uncertaintyScore += 40;
         reasons.push("DriftWarning");
     }
     if (!stability.isStable) {
-        uncertaintyScore += (stability.reason.includes("Dominance") || stability.reason.includes("Choppiness")) ? 40 : 30;
+        uncertaintyScore += (stability.reason.includes("Dominance") || stability.reason.includes("Choppiness")) ? 50 : 40;
         reasons.push(`Instability:${stability.reason}`);
     }
     if (marketEntropyState.state.includes("CHAOS")) {
-        uncertaintyScore += marketEntropyState.state === "RISING_CHAOS" ? 35 : 25;
+        uncertaintyScore += marketEntropyState.state === "RISING_CHAOS" ? 45 : 35;
         reasons.push(marketEntropyState.state);
     }
-    if (signalConsistency.score < 0.65) {
-        uncertaintyScore += (1 - signalConsistency.score) * 40;
+    if (signalConsistency.score < 0.6) {
+        uncertaintyScore += (1 - signalConsistency.score) * 50;
         reasons.push(`LowConsistency:${signalConsistency.score.toFixed(2)}`);
     }
     if (pathConfluence.diversePaths < 3) {
-        uncertaintyScore += (3 - pathConfluence.diversePaths) * 10;
+        uncertaintyScore += (3 - pathConfluence.diversePaths) * 15;
         reasons.push(`LowConfluence:${pathConfluence.diversePaths}`);
     }
     if (trendContext.isTransitioning) {
-        uncertaintyScore += 20;
+        uncertaintyScore += 25;
         reasons.push("RegimeTransition");
     }
     if (trendContext.volatility === "HIGH") {
-        uncertaintyScore += 15;
+        uncertaintyScore += 20;
         reasons.push("HighVolatility");
     }
-    if (typeof globalAccuracy === 'number' && globalAccuracy < 0.48) {
-        uncertaintyScore += (0.48 - globalAccuracy) * 120;
+     if (typeof globalAccuracy === 'number' && globalAccuracy < 0.48) {
+        uncertaintyScore += (0.48 - globalAccuracy) * 150;
         reasons.push(`LowGlobalAcc:${globalAccuracy.toFixed(2)}`);
     }
+
     return { score: uncertaintyScore, reasons: reasons.join(';') };
 }
 
-function checkPerformanceAndSetMode(history) {
-    const recentHistory = history.filter(p => p.status === 'win' || p.status === 'loss').slice(0, 20);
-    if (recentHistory.length < 15) {
-        engineMode = "NORMAL";
-        GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE = 0.5;
-        return;
-    }
-    const wins = recentHistory.filter(p => p.status === 'win').length;
-    const winRate = wins / recentHistory.length;
-    GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE = winRate;
-    if (winRate < 0.35 && engineMode === "NORMAL") {
-        console.log(`[MODE_SWITCH] Win rate dropped to ${(winRate * 100).toFixed(1)}%. Switching to CONTRARIAN mode.`);
-        engineMode = "CONTRARIAN";
-    } else if (winRate > 0.50 && engineMode === "CONTRARIAN") {
-        console.log(`[MODE_SWITCH] Win rate recovered to ${(winRate * 100).toFixed(1)}%. Switching back to NORMAL mode.`);
-        engineMode = "NORMAL";
-    }
-}
+function createFeatureSetForML(history, trendContext, time) {
+    const numbers = history.map(e => parseInt(e.actualNumber || e.actual)).filter(n => !isNaN(n));
+    if(numbers.length < 52) return null; 
 
-// --- Main Prediction Cycle & Logic ---
-async function processPredictionCycle(gameData, currentHistoryData, lastProcessedPeriodId) {
-    loadPredictionEngineState();
-    console.log("\n--- Starting New Prediction Cycle ---");
-    if (!gameData || !gameData.issueNumber || !gameData.number) {
-        console.warn("Invalid game data received from API. Skipping prediction cycle update.");
-        return null;
-    }
-    const currentPeriodFull = String(gameData.issueNumber);
-    const actualNumber = parseInt(String(gameData.number), 10);
-    const actualType = getBigSmallType(actualNumber);
-    let tempHistory = JSON.parse(JSON.stringify(currentHistoryData));
-    let currentSharedStatsForNextPrediction = {};
-    let resolvedThisCycle = false;
-    const entryToUpdateIndex = tempHistory.findIndex(item =>
-        item.periodFull === currentPeriodFull && item.status === 'pending'
-    );
-    if (entryToUpdateIndex !== -1) {
-        const entryToUpdate = tempHistory[entryToUpdateIndex];
-        entryToUpdate.actual = actualNumber;
-        entryToUpdate.actualType = actualType;
-        const mainPredictionWins = entryToUpdate.prediction === actualType;
-        if (mainPredictionWins) {
-            entryToUpdate.status = 'win';
-            systemConsecutiveLosses = 0;
-        } else {
-            entryToUpdate.status = 'loss';
-            systemConsecutiveLosses++;
-        }
-        console.log(`Resolved history for period ${currentPeriodFull}: Status ${entryToUpdate.status}. AI Predicted: ${entryToUpdate.prediction}, Actual: ${actualType} (${actualNumber}).`);
-        currentSharedStatsForNextPrediction = {
-            lastActualOutcome: actualNumber,
-            lastPredictedOutcome: entryToUpdate.prediction,
-            lastFinalConfidence: entryToUpdate.confidence,
-            lastConfidenceLevel: (entryToUpdate.confidence > 75) ? 3 : (entryToUpdate.confidence > 62 ? 2 : 1),
-            lastMacroRegime: entryToUpdate.macroRegime,
-            lastConcentrationModeEngaged: entryToUpdate.concentrationModeEngaged,
-            lastMarketEntropyState: entryToUpdate.marketEntropyState,
-            lastVolatilityRegime: entryToUpdate.lastVolatilityRegime,
-            lastPeriodFull: currentPeriodFull,
-            longTermGlobalAccuracy: GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE
-        };
-        const confirmedHistory = tempHistory.filter(h => h.actual !== null && h.status !== 'pending' && h.status !== 'skipped');
-        updateSignalPerformance(
-            actualType,
-            entryToUpdate.prediction,
-            currentPeriodFull,
-            entryToUpdate.lastVolatilityRegime || 'UNKNOWN',
-            entryToUpdate.confidence,
-            entryToUpdate.concentrationModeEngaged || false,
-            entryToUpdate.marketEntropyState || 'STABLE_MODERATE',
-            entryToUpdate.macroRegime || 'DEFAULT'
-        );
-        updateQLearningState(confirmedHistory, entryToUpdate.prediction, actualType);
-        if (entryToUpdate.macroRegime) {
-            updateRegimeProfilePerformance(entryToUpdate.macroRegime, actualType, entryToUpdate.prediction);
-        }
-        checkPerformanceAndSetMode(tempHistory);
-        const isOverallPredictionCorrect = (entryToUpdate.prediction === actualType);
-        currentSharedStatsForNextPrediction.driftState = detectConceptDrift(isOverallPredictionCorrect);
-        resolvedThisCycle = true;
-    } else {
-        console.warn(`No pending history entry found for resolved period: ${currentPeriodFull}. Adding it as 'skipped'.`);
-        const isNewResolvedGame = !tempHistory.some(item => item.periodFull === currentPeriodFull);
-        if (isNewResolvedGame) {
-            tempHistory.unshift({
-                periodFull: currentPeriodFull,
-                periodDisplay: currentPeriodFull.slice(-5),
-                prediction: actualType,
-                number: actualNumber,
-                actual: actualNumber,
-                actualType: actualType,
-                status: 'skipped',
-                timestamp: Date.now(),
-                confidence: 50,
-                rationale: "History entry added retroactively (no prior pending prediction)."
-            });
-            console.log(`Added resolved period ${currentPeriodFull} as 'skipped' to history.`);
-        }
-    }
-    const nextPeriodFull = (BigInt(currentPeriodFull) + 1n).toString();
-    const { prediction: newAiPrediction, number: nextPredictedNumber, finalConfidence: newConfidence, overallLogic: newRationale, contributingSignals: newContributingSignals, currentMacroRegime: newMacroRegime, marketEntropyState: newMarketEntropyState, concentrationModeEngaged: newConcentrationModeEngaged, lastVolatilityRegime: newVolatilityRegime, predictionQualityScore: newPQS }
-        = await generateNewPrediction(tempHistory, systemConsecutiveLosses, nextPeriodFull, currentSharedStatsForNextPrediction);
-    const existingPendingNextPeriodEntry = tempHistory.find(item =>
-        item.periodFull === nextPeriodFull && item.status === 'pending'
-    );
-    if (existingPendingNextPeriodEntry) {
-        existingPendingNextPeriodEntry.prediction = newAiPrediction;
-        existingPendingNextPeriodEntry.number = nextPredictedNumber;
-        existingPendingNextPeriodEntry.confidence = newConfidence;
-        existingPendingNextPeriodEntry.rationale = newRationale;
-        existingPendingNextPeriodEntry.contributingSignals = newContributingSignals;
-        existingPendingNextPeriodEntry.macroRegime = newMacroRegime;
-        existingPendingNextPeriodEntry.marketEntropyState = newMarketEntropyState;
-        existingPendingNextPeriodEntry.concentrationModeEngaged = newConcentrationModeEngaged;
-        existingPendingNextPeriodEntry.lastVolatilityRegime = newVolatilityRegime;
-        existingPendingNextPeriodEntry.predictionQualityScore = newPQS;
-        console.log(`Updated existing pending prediction for period ${nextPeriodFull}.`);
-    } else {
-        tempHistory.unshift({
-            periodFull: nextPeriodFull,
-            periodDisplay: nextPeriodFull.slice(-5),
-            prediction: newAiPrediction,
-            number: nextPredictedNumber,
-            confidence: newConfidence,
-            actual: null,
-            status: 'pending',
-            timestamp: Date.now(),
-            rationale: newRationale,
-            contributingSignals: newContributingSignals,
-            macroRegime: newMacroRegime,
-            marketEntropyState: newMarketEntropyState,
-            concentrationModeEngaged: newConcentrationModeEngaged,
-            lastVolatilityRegime: newVolatilityRegime,
-            predictionQualityScore: newPQS
-        });
-        console.log(`Added new pending prediction for period ${nextPeriodFull}.`);
-    }
-    if (tempHistory.length > 200) {
-        tempHistory = tempHistory.slice(0, 200);
-    }
-    savePredictionEngineState();
     return {
-        updatedHistoryData: tempHistory,
-        updatedSystemLosses: systemConsecutiveLosses,
-        nextPeriodPrediction: newAiPrediction,
-        nextPeriodPredictedNumber: nextPredictedNumber,
-        nextPeriodConfidence: newConfidence,
-        lastProcessedPeriodId: currentPeriodFull,
-        rationale: newRationale
+        time_sin: time.sin,
+        time_cos: time.cos,
+        last_5_mean: calculateSMA(numbers, 5),
+        last_20_mean: calculateSMA(numbers, 20),
+        stddev_10: calculateStdDev(numbers, 10),
+        stddev_30: calculateStdDev(numbers, 30),
+        rsi_14: calculateRSI(numbers, 14),
+        stoch_k_14: analyzeStochastic(history, 14, 3, 3, 1.0, trendContext.volatility)?.currentK, 
+        macd_hist: analyzeMACD(history, 12, 26, 9, 1.0)?.macdHistogram, 
+        trend_strength: trendContext.strength === 'STRONG' ? 2 : (trendContext.strength === 'MODERATE' ? 1 : 0),
+        volatility_level: trendContext.volatility === 'HIGH' ? 2 : (trendContext.volatility === 'MEDIUM' ? 1 : 0),
     };
 }
 
-async function generateNewPrediction(history, currentSystemLosses, nextPeriodFull, currentSharedStats) {
-    console.log(`Refined Supercore vCombined Initializing Prediction for period ${nextPeriodFull}. MODE: ${engineMode}`);
-    let masterLogic = [`RScore_Combined(M:${engineMode})`];
+
+// --- Main Prediction Function ---
+/**
+ * **FIXED in v44.1.0: Synchronous, Production-Ready Engine**
+ * @param {Array} currentSharedHistory - The historical data for predictions.
+ * @param {object} sharedStatsPayload - The complete state object from the previous run.
+ * @returns {object} An object containing the prediction and the updated state.
+ */
+function ultraAIPredict(currentSharedHistory, sharedStatsPayload = {}) {
+    let currentSharedStats = sharedStatsPayload;
+
+    const currentPeriodFull = Date.now();
     const time = getCurrentISTHour();
+
+    // --- Synchronous Data Simulation ---
+    const realTimeData = getRealTimeExternalData();
+
+    console.log(`Quantum AI Supercore v44.2.0 Initializing Prediction for period ${currentPeriodFull}`);
+    let masterLogic = [`QAScore_v44.2(IST_Hr:${time.raw})`];
+    masterLogic.push(realTimeData.reason);
+
+    // --- Dynamic & Adaptive Setup ---
+    const trendContext = getMarketRegimeAndTrendContext(currentSharedHistory);
+    const stability = analyzeTrendStability(currentSharedHistory);
+    const updatedAurochsState = discoverAndAdaptRegimes(currentSharedHistory, trendContext, stability, currentSharedStats);
+
+    // Check if a new regime was discovered and re-evaluate trend context
+    let finalTrendContext = getMarketRegimeAndTrendContext(currentSharedHistory);
+    if (updatedAurochsState.choppyCount >= 8) {
+       finalTrendContext.macroRegime = "CUSTOM_AUROCHS_MODE";
+    }
+
     const primeTimeSession = getPrimeTimeSession(time.raw);
-    let primeTimeAggression = 1.0;
-    let primeTimeConfidence = 1.0;
     if (primeTimeSession) {
         masterLogic.push(`!!! PRIME TIME ACTIVE: ${primeTimeSession.session} !!!`);
-        primeTimeAggression = primeTimeSession.aggression;
-        primeTimeConfidence = primeTimeSession.confidence;
     }
+
+    let longTermGlobalAccuracy = currentSharedStats?.longTermGlobalAccuracy || GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE;
+    if (currentSharedStats && typeof currentSharedStats.longTermGlobalAccuracy === 'number') {
+        GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE = currentSharedStats.longTermGlobalAccuracy;
+    }
+
     const isReflexiveCorrection = checkForAnomalousPerformance(currentSharedStats);
     if (isReflexiveCorrection) {
         masterLogic.push(`!!! REFLEXIVE CORRECTION ACTIVE !!! (Countdown: ${reflexiveCorrectionActive})`);
     }
-    const confirmedHistory = history.filter(p => p && p.actual !== null && typeof p.actual !== 'undefined');
-    if (confirmedHistory.length < 25) {
-        masterLogic.push(`InsufficientHistory_ForceDeterministicDefault`);
-        const finalDecision = (BigInt(nextPeriodFull) % 2n === 0n) ? "BIG" : "SMALL";
-        const predictedNumber = finalDecision === 'BIG' ? Math.floor(mulberry32(parseInt(nextPeriodFull.slice(-6)) + 5)() * 5) + 5 : Math.floor(mulberry32(parseInt(nextPeriodFull.slice(-6)))() * 5);
-        return {
-             prediction: finalDecision, number: predictedNumber, finalDecision: finalDecision, finalConfidence: 50, confidenceLevel: 1, isForcedPrediction: true,
-             overallLogic: masterLogic.join(' -> '), source: "InsufficientHistory", contributingSignals: [], currentMacroRegime: 'UNKNOWN_REGIME',
-             concentrationModeEngaged: false, predictionQualityScore: 0.01,
-             lastPredictedOutcome: finalDecision, lastFinalConfidence: 50,
-             lastConfidenceLevel: 1, lastMacroRegime: 'UNKNOWN_REGIME', lastPredictionSignals: [], lastConcentrationModeEngaged: false,
-             lastMarketEntropyState: 'UNCERTAIN_ENTROPY', lastVolatilityRegime: 'UNKNOWN',
-             periodFull: nextPeriodFull
-        };
-    }
-    const trendContext = getMarketRegimeAndTrendContext(confirmedHistory);
-    masterLogic.push(`TrendCtx(Dir:${trendContext.direction},Str:${trendContext.strength},Vol:${trendContext.volatility},Regime:${trendContext.macroRegime})`);
-    const stability = analyzeTrendStability(confirmedHistory);
-    const marketEntropyAnalysis = analyzeMarketEntropyState(confirmedHistory, trendContext, stability);
+
+    masterLogic.push(`TrendCtx(Dir:${finalTrendContext.direction},Str:${finalTrendContext.strength},Vol:${finalTrendContext.volatility},Regime:${finalTrendContext.macroRegime})`);
+
+    const marketEntropyAnalysis = analyzeMarketEntropyState(currentSharedHistory, finalTrendContext, stability);
     masterLogic.push(`MarketEntropy:${marketEntropyAnalysis.state}`);
+
+    const advancedRegime = analyzeAdvancedMarketRegime(finalTrendContext, marketEntropyAnalysis);
+    masterLogic.push(`AdvRegime:${advancedRegime.details}`);
+
     let concentrationModeEngaged = !stability.isStable || isReflexiveCorrection || marketEntropyAnalysis.state.includes("CHAOS");
-    let driftState = currentSharedStats?.driftState || 'STABLE';
-    if (driftState !== 'STABLE') {
-        masterLogic.push(`!!! DRIFT DETECTED: ${driftState} !!!`);
-        concentrationModeEngaged = true;
+
+    let driftState = 'STABLE';
+    if (currentSharedStats && typeof currentSharedStats.lastActualOutcome !== 'undefined') {
+        const lastPredictionWasCorrect = getBigSmallFromNumber(currentSharedStats.lastActualOutcome) === currentSharedStats.lastPredictedOutcome;
+        driftState = detectConceptDrift(lastPredictionWasCorrect);
+        if (driftState !== 'STABLE') {
+            masterLogic.push(`!!! DRIFT DETECTED: ${driftState} !!!`);
+            concentrationModeEngaged = true;
+        }
     }
+
     if (concentrationModeEngaged) masterLogic.push(`ConcentrationModeActive`);
-    const currentVolatilityRegimeForPerf = trendContext.volatility;
-    const currentMacroRegime = trendContext.macroRegime;
+
+    const currentVolatilityRegimeForPerf = finalTrendContext.volatility;
+    const currentMacroRegime = finalTrendContext.macroRegime;
+    if (currentSharedStats && currentSharedStats.lastPredictionSignals && currentSharedStats.lastActualOutcome) {
+        updateSignalPerformance(
+            currentSharedStats.lastPredictionSignals,
+            getBigSmallFromNumber(currentSharedStats.lastActualOutcome),
+            currentSharedStats.lastPeriodFull,
+            currentSharedStats.lastVolatilityRegime || currentVolatilityRegimeForPerf,
+            currentSharedStats.lastFinalConfidence,
+            currentSharedStats.lastConcentrationModeEngaged || false,
+            currentSharedStats.lastMarketEntropyState || "STABLE_MODERATE"
+        );
+        if (currentSharedStats.lastPredictedOutcome) {
+            updateRegimeProfilePerformance(currentSharedStats.lastMacroRegime, getBigSmallFromNumber(currentSharedStats.lastActualOutcome), currentSharedStats.lastPredictedOutcome);
+        }
+    }
+
+    const confirmedHistory = currentSharedHistory.filter(p => p && p.actual !== null && p.actualNumber !== undefined);
+    if (confirmedHistory.length < 52) {
+        masterLogic.push(`InsufficientHistory_ForceRandom`);
+        const finalDecision = Math.random() > 0.5 ? "BIG" : "SMALL";
+        const predictionOutput = {
+            predictions: { BIG: { confidence: 0.5, logic: "ForcedRandom" }, SMALL: { confidence: 0.5, logic: "ForcedRandom" } },
+            finalDecision: finalDecision, finalConfidence: 0.5, confidenceLevel: 1, isForcedPrediction: true,
+            overallLogic: masterLogic.join(' -> '), source: "InsufficientHistory",
+        };
+        const newState = {
+            ...currentSharedStats,
+            lastPredictedOutcome: finalDecision, lastFinalConfidence: 0.5, lastConfidenceLevel: 1, lastMacroRegime: currentMacroRegime,
+            lastPredictionSignals: [], lastConcentrationModeEngaged: concentrationModeEngaged,
+            lastMarketEntropyState: marketEntropyAnalysis.state, lastVolatilityRegime: finalTrendContext.volatility, periodFull: currentPeriodFull,
+            aurochsState: updatedAurochsState
+        };
+        // In this edge case, return only the prediction object. The state is not fully formed.
+        return sanitizeForFirebase(predictionOutput);
+    }
+
+    let signals = [];
     const currentRegimeProfile = REGIME_SIGNAL_PROFILES[currentMacroRegime] || REGIME_SIGNAL_PROFILES["DEFAULT"];
-    const recentNumbersSummary = confirmedHistory.slice(0, 10).map(h => `${h.periodDisplay}:${getBigSmallType(h.actual)}`).join(', ');
-    const overallOutcomeCounts = { BIG: 0, SMALL: 0 };
-    confirmedHistory.slice(0, 50).forEach(h => {
-        const type = getBigSmallType(h.actual);
-        if (type) overallOutcomeCounts[type]++;
+    let regimeContextualAggression = (currentRegimeProfile.contextualAggression || 1.0) * (primeTimeSession?.aggression || 1.0);
+
+    if (isReflexiveCorrection || driftState === 'DRIFT') regimeContextualAggression *= 0.25;
+    else if (concentrationModeEngaged) regimeContextualAggression *= 0.6;
+
+    // --- Combined Signal Generation ---
+    const signalGenerators = [
+        () => analyzeTransitions(confirmedHistory, 0.05),
+        () => analyzeStreaks(confirmedHistory, 0.045),
+        () => analyzeAlternatingPatterns(confirmedHistory, 0.06),
+        () => analyzeRSI(confirmedHistory, 14, 0.08, finalTrendContext.volatility),
+        () => analyzeMACD(confirmedHistory, 12, 26, 9, 0.09),
+        () => analyzeBollingerBands(confirmedHistory, 20, 2.1, 0.07),
+        () => analyzeIchimokuCloud(confirmedHistory, 9, 26, 52, 0.14),
+        () => analyzeStochastic(confirmedHistory, 14, 3, 3, 0.08, finalTrendContext.volatility),
+        () => analyzeVolatilityTrendFusion(finalTrendContext, marketEntropyAnalysis, 0.25)
+    ];
+
+    const mlFeatures = createFeatureSetForML(confirmedHistory, finalTrendContext, time);
+    if(mlFeatures) {
+         if (currentRegimeProfile.activeSignalTypes.includes('ml_standard')) {
+            signalGenerators.push(() => analyzeMLModelSignal_Standard(mlFeatures, 0.40));
+         }
+         if (currentRegimeProfile.activeSignalTypes.includes('ml_volatile')) {
+            signalGenerators.push(() => analyzeMLModelSignal_Volatile(mlFeatures, 0.45));
+         }
+    }
+
+    signalGenerators.forEach(gen => {
+        const result = gen();
+        if (result && result.weight && result.prediction) {
+            result.adjustedWeight = getDynamicWeightAdjustment(result.source, result.weight * regimeContextualAggression, currentPeriodFull, currentVolatilityRegimeForPerf, currentSharedHistory);
+            signals.push(result);
+        }
     });
-    const overallBias = overallOutcomeCounts.BIG > overallOutcomeCounts.SMALL ? "BIG biased" : (overallOutcomeCounts.SMALL > overallOutcomeCounts.BIG ? "SMALL biased" : "balanced");
-    const signalPerformanceSummary = Object.entries(signalPerformance)
-        .filter(([source, perf]) => perf.total >= MIN_OBSERVATIONS_FOR_ADJUST)
-        .map(([source, perf]) => {
-            const accuracy = perf.total > 0 ? (perf.correct / perf.total) * 100 : 0;
-            const probationStatus = perf.isOnProbation ? ' (ON PROBATION)' : '';
-            const currentAdj = perf.currentAdjustmentFactor.toFixed(2);
-            const longTermImp = perf.longTermImportanceScore.toFixed(2);
-            return `${source}: Acc=${accuracy.toFixed(1)}%, AdjFactor=${currentAdj}, ImpScore=${longTermImp}${probationStatus}`;
-        }).join('\n');
-    let qTableInsight = "No specific Q-table insights.";
-    const qLearningInsight = getQLearningInsight(confirmedHistory);
-    if (qLearningInsight) {
-        const qv = qLearningInsight.qValues;
-        if (qv.BIG > qv.SMALL) {
-            qTableInsight = `Q-Learning favors BIG (Q_BIG:${qv.BIG.toFixed(2)}, Q_SMALL:${qv.SMALL.toFixed(2)}) for state '${qLearningInsight.state}'.`;
-        } else if (qv.SMALL > qv.BIG) {
-            qTableInsight = `Q-Learning favors SMALL (Q_BIG:${qv.BIG.toFixed(2)}, Q_SMALL:${qv.SMALL.toFixed(2)}) for state '${qLearningInsight.state}'.`;
-        } else {
-            qTableInsight = `Q-Learning is neutral for state '${qLearningInsight.state}'.`;
-        }
+
+    const validSignals = signals.filter(s => s?.prediction && s.adjustedWeight > MIN_ABSOLUTE_WEIGHT);
+    masterLogic.push(`ValidSignals(${validSignals.length}/${signals.length})`);
+
+    if (validSignals.length === 0) {
+        masterLogic.push(`NoValidSignals_ForceRandom`);
+        const finalDecision = Math.random() > 0.5 ? "BIG" : "SMALL";
+        const predictionOutput = {
+            predictions: { BIG: { confidence: 0.5, logic: "ForcedRandom" }, SMALL: { confidence: 0.5, logic: "ForcedRandom" } },
+            finalDecision: finalDecision, finalConfidence: 0.5, confidenceLevel: 1, isForcedPrediction: true,
+            overallLogic: masterLogic.join(' -> '), source: "NoValidSignals",
+        };
+         const newState = {
+            ...currentSharedStats,
+            lastPredictedOutcome: finalDecision, lastFinalConfidence: 0.5, lastConfidenceLevel: 1, lastMacroRegime: currentMacroRegime,
+            lastPredictionSignals: [], lastConcentrationModeEngaged: concentrationModeEngaged,
+            lastMarketEntropyState: marketEntropyAnalysis.state, lastVolatilityRegime: finalTrendContext.volatility, periodFull: currentPeriodFull,
+            aurochsState: updatedAurochsState
+        };
+        return sanitizeForFirebase(predictionOutput);
     }
-    const ichimokuResult = analyzeIchimokuCloud(confirmedHistory, 9, 26, 52);
-    const rsiValue = calculateRSI(confirmedHistory.map(h => h.actual), 14);
-    const stochasticValue = calculateStochastic(confirmedHistory.map(h => h.actual), 14, 3);
-    const volTrendFusionResult = analyzeVolatilityTrendFusion(trendContext, marketEntropyAnalysis);
-    const numerologyResult = analyzePeriodNumerology(nextPeriodFull);
-    const arimaResult = analyzeARIMA(confirmedHistory);
-    const lstmPatternResult = analyzeLSTMPattern(confirmedHistory);
-    let specificSignalInsights = [];
-    if (ichimokuResult) specificSignalInsights.push(`Ichimoku Cloud: ${ichimokuResult.summary}`);
-    if (rsiValue !== null) specificSignalInsights.push(`RSI(14): ${rsiValue.toFixed(2)} (Overbought>70, Oversold<30)`);
-    if (stochasticValue !== null) specificSignalInsights.push(`Stochastic(%K:${stochasticValue.k.toFixed(2)}, %D:${stochasticValue.d.toFixed(2)}) (Overbought>80, Oversold<20)`);
-    if (volTrendFusionResult) specificSignalInsights.push(`Vol-Trend-Fusion: Predicted ${volTrendFusionResult.prediction} with ${volTrendFusionResult.confidence.toFixed(1)}% confidence.`);
-    if (numerologyResult) specificSignalInsights.push(`Period Numerology: Predicted ${numerologyResult.prediction} with ${numerologyResult.confidence.toFixed(1)}% confidence.`);
-    if (arimaResult) specificSignalInsights.push(`Simplified ARIMA: Predicted ${arimaResult.prediction} with ${arimaResult.confidence.toFixed(1)}% confidence.`);
-    if (lstmPatternResult) specificSignalInsights.push(`Simplified LSTM Pattern: Predicted ${lstmPatternResult.prediction} with ${lstmPatternResult.confidence.toFixed(1)}% confidence.`);
-    const prompt = `
-You are the "Combined Prediction Engine - Head Agent". Your task is to analyze various market context signals, historical data, and performance metrics to make an accurate prediction ("BIG" or "SMALL") for the next period, along with a confidence score and a predicted number (0-9). You are acting as the central intelligence integrating insights from various "sub-systems" and "tools."
 
-**Current Request:**
-- Predict for next period: ${nextPeriodFull}
+    const consensus = analyzePredictionConsensus(validSignals, finalTrendContext);
+    masterLogic.push(`Consensus:${consensus.details},Factor:${consensus.factor.toFixed(2)}`);
 
-**Market & System State:**
-- **Recent History (last 10 actual outcomes - Period:Type):** ${recentNumbersSummary}
-- **Overall History Bias (last 50 periods):** The market has recently shown a ${overallBias} bias.
-- **Consecutive System Losses:** ${currentSystemLosses} (If > 0, system is in a loss streak. Prioritize recovery if high.)
-- **Reflexive Correction Active:** ${isReflexiveCorrection ? 'YES (Forced adjustment active for crisis recovery - consider aggressive counter-trend)' : 'NO'}
-- **Engine Mode:** ${engineMode} (If 'CONTRARIAN', you should consider inverting your most likely prediction based on consensus.)
-- **Concept Drift State:** ${driftState} (If 'WARNING' or 'DRIFT', indicate increased uncertainty and caution. Prefer conservative or opposite predictions.)
+    let bigScore = 0; let smallScore = 0;
+    validSignals.forEach(signal => {
+        if (signal.prediction === "BIG") bigScore += signal.adjustedWeight;
+        else if (signal.prediction === "SMALL") smallScore += signal.adjustedWeight;
+    });
 
-**Detailed Market Environment Analysis:**
-- **Trend Context:**
-    - Strength: ${trendContext.strength} (e.g., STRONG, MODERATE, RANGING, WEAK)
-    - Direction: ${trendContext.direction} (e.g., BIG, SMALL, NONE - current trend direction)
-    - Volatility: ${trendContext.volatility} (e.g., HIGH, MEDIUM, LOW, VERY_LOW - how much movement)
-    - Macro Regime: ${currentMacroRegime} (e.g., TREND_STRONG_LOW_VOL, RANGE_HIGH_VOL - overarching market state)
-    - Is Transitioning: ${trendContext.isTransitioning ? 'YES (Market might be changing regime, increased uncertainty)' : 'NO'}
-- **Market Stability:**
-    - Stable: ${stability.isStable ? 'YES (Predictability likely higher)' : 'NO'}
-    - Reason for Instability: ${stability.isStable ? 'N/A' : stability.reason}
-    - Dominance: ${stability.dominance} (e.g., BIG_DOMINANCE if BIG has occurred too frequently)
-- **Market Entropy State:** ${marketEntropyAnalysis.state} (e.g., ORDERLY, STABLE_CHAOS, RISING_CHAOS, SUBSIDING_CHAOS - how random/predictable outcomes are)
-- **Concentration Mode Engaged:** ${concentrationModeEngaged ? 'YES (High alert, focus on highly robust signals, consider reduced aggression)' : 'NO'}
-- **Prime Time Session:** ${primeTimeSession ? `YES (${primeTimeSession.session}, Potential for increased aggression and confidence: Aggression: ${primeTimeSession.aggression.toFixed(2)}, Confidence Boost: ${primeTimeSession.confidence.toFixed(2)})` : 'NO'}
+    bigScore *= (1 + advancedRegime.probabilities.bullTrend - advancedRegime.probabilities.bearTrend);
+    smallScore *= (1 + advancedRegime.probabilities.bearTrend - advancedRegime.probabilities.bullTrend);
 
-**Signal & Heuristic Performance Overview (Long-term & Adaptive Feedback for your weighting):**
-This section provides you with the performance history of various underlying "signals" or "tools". Use this information to implicitly weight their importance in your decision.
-${signalPerformanceSummary.length > 0 ? signalPerformanceSummary : 'No sufficient data yet for individual signal performance analysis.'}
+    bigScore *= consensus.factor;
+    smallScore *= (2.0 - consensus.factor);
 
-**Specific Signal Insights:**
-These are direct insights from various analytical models. Integrate them into your decision.
-${specificSignalInsights.length > 0 ? specificSignalInsights.join('\n') : 'No specific insights from advanced signals available yet.'}
+    const totalScore = bigScore + smallScore;
+    let finalDecision = totalScore > 0 ? (bigScore >= smallScore ? "BIG" : "SMALL") : (Math.random() > 0.5 ? "BIG" : "SMALL");
+    let finalConfidence = totalScore > 0 ? Math.max(bigScore, smallScore) / totalScore : 0.5;
 
-**Learned Q-Table Insight:**
-${qTableInsight}
+    finalConfidence = 0.5 + (finalConfidence - 0.5) * (primeTimeSession?.confidence || 1.0) * realTimeData.factor;
 
-**Your Final Task:**
-Based on all the above comprehensive information, acting as the intelligent "Head Agent", predict the \`finalDecision\` ("BIG" or "SMALL"), the \`number\` (a single digit from 0-9 that corresponds to your final decision - 0-4 for SMALL, 5-9 for BIG), the \`finalConfidence\` (percentage from 0-100), and a concise \`rationale\` (1-2 sentences explaining your primary reasons).
+    const signalConsistency = analyzeSignalConsistency(validSignals, finalTrendContext);
+    const pathConfluence = analyzePathConfluenceStrength(validSignals, finalDecision);
+    const uncertainty = calculateUncertaintyScore(finalTrendContext, stability, marketEntropyAnalysis, signalConsistency, pathConfluence, longTermGlobalAccuracy, isReflexiveCorrection, driftState);
 
-Consider the following guidance:
-- If \`currentSystemLosses\` is > 0 and \`reflexiveCorrectionActive\` is YES, your primary goal is recovery. Strongly consider reversing the last predominant outcome or the system's last losing prediction.
-- If \`engineMode\` is 'CONTRARIAN', consider inverting your most likely prediction to exploit market inefficiencies.
-- High \`ConcentrationModeEngaged\`, \`DRIFT\` state, or \`RISING_CHAOS\` typically implies increased risk and uncertainty. You might want to make more conservative predictions, or even lean towards the opposite of consensus, or lower confidence.
-- \`Prime Time\` sessions might allow for slightly higher confidence or more aggressive predictions.
-- Implicitly weigh the various "signals" based on their reported performance (Acc, AdjFactor, ImpScore).
-- Ensure the \`number\` you predict falls into the range implied by your \`finalDecision\`. If \`finalDecision\` is "BIG", predict a number from 5-9. If "SMALL", predict 0-4. Make this number selection appear intelligently derived, but ensure it's valid.
+    const uncertaintyFactor = 1.0 - Math.min(1.0, uncertainty.score / 120.0);
+    finalConfidence = 0.5 + (finalConfidence - 0.5) * uncertaintyFactor;
+    masterLogic.push(`Uncertainty(Score:${uncertainty.score.toFixed(0)},Factor:${uncertaintyFactor.toFixed(2)})`);
 
-Provide your response strictly as a JSON object with the following schema:
-\`\`\`json
-{
-  "finalDecision": "BIG" | "SMALL",
-  "number": 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9,
-  "finalConfidence": "number (0-100)",
-  "rationale": "string"
-}
-\`\`\`
-`;
-    let response;
-    try {
-        let chatHistory = [];
-        chatHistory.push({ role: "user", parts: [{ text: prompt }] });
-        const payload = {
-            contents: chatHistory,
-            generationConfig: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                    type: "OBJECT",
-                    properties: {
-                        "finalDecision": { "type": "STRING", "enum": ["BIG", "SMALL"] },
-                        "number": { "type": "INTEGER", "minimum": 0, "maximum": 9 },
-                        "finalConfidence": { "type": "INTEGER", "minimum": 0, "maximum": 100 },
-                        "rationale": { "type": "STRING" }
-                    },
-                    required: ["finalDecision", "number", "finalConfidence", "rationale"]
-                }
-            }
-        };
-        const apiKey = process.env.GEMINI_API_KEY;
-        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-        response = await fetch(apiUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        const result = await response.json();
-        let parsedLLMResponse;
-        if (result.candidates && result.candidates.length > 0 &&
-            result.candidates[0].content && result.candidates[0].content.parts &&
-            result.candidates[0].content.parts.length > 0) {
-            try {
-                parsedLLMResponse = JSON.parse(result.candidates[0].content.parts[0].text);
-            } catch (jsonError) {
-                console.error("Error parsing LLM response JSON:", jsonError);
-                console.error("Raw LLM response:", result.candidates[0].content.parts[0].text);
-                throw new Error("Failed to parse LLM response as JSON.");
-            }
-        } else {
-            throw new Error("No valid content found in LLM response.");
-        }
-        let finalDecision = parsedLLMResponse.finalDecision;
-        let predictedNumber = parsedLLMResponse.number;
-        let finalConfidence = parsedLLMResponse.finalConfidence;
-        let rationale = parsedLLMResponse.rationale;
-        if (finalDecision === "BIG" && (predictedNumber < 5 || predictedNumber > 9)) {
-            console.warn(`LLM predicted BIG but number ${predictedNumber} is out of range. Adjusting to 5.`);
-            predictedNumber = 5;
-        } else if (finalDecision === "SMALL" && (predictedNumber < 0 || predictedNumber > 4)) {
-            console.warn(`LLM predicted SMALL but number ${predictedNumber} is out of range. Adjusting to 0.`);
-            predictedNumber = 0;
-        }
-        finalConfidence = Math.min(100, Math.max(0, finalConfidence));
-        let confidenceLevel = 1;
-        let highConfThreshold = 75, medConfThreshold = 62;
-        if (primeTimeSession) {
-            highConfThreshold -= 5; medConfThreshold -= 5;
-        }
-        if (finalConfidence > medConfThreshold) confidenceLevel = 2;
-        if (finalConfidence > highConfThreshold) confidenceLevel = 3;
-        const signalConsistency = analyzeSignalConsistency([]);
-        const activeSignalSources = Object.keys(signalPerformance).filter(source => {
-            const signalType = source.includes('_LHT') ? source.split('_')[0].toLowerCase() : source.split('-')[0].toLowerCase();
-            return currentRegimeProfile.activeSignalTypes.includes('all') || currentRegimeProfile.activeSignalTypes.includes(signalType);
-        });
-        const pathConfluence = analyzePathConfluenceStrength(activeSignalSources.map(s => ({ source: s })), finalDecision);
-        const uncertainty = calculateUncertaintyScore(trendContext, stability, marketEntropyAnalysis, signalConsistency, pathConfluence, GLOBAL_LONG_TERM_ACCURACY_FOR_LEARNING_RATE, isReflexiveCorrection, driftState);
-        let pqs = 0.5 + (finalConfidence / 100 - 0.5) * 0.4 + pathConfluence.score * 1.2;
-        pqs = Math.max(0.01, Math.min(0.99, pqs - (uncertainty.score / 500)));
-        const output = {
-            prediction: finalDecision,
-            number: predictedNumber,
-            finalDecision: finalDecision,
-            finalConfidence: finalConfidence,
-            confidenceLevel: confidenceLevel,
-            isForcedPrediction: isReflexiveCorrection || (uncertainty.score >= (isReflexiveCorrection || driftState === 'DRIFT' ? 85 : 105) || pqs < 0.15),
-            overallLogic: masterLogic.join(' -> ') + ` -> LLM_Decision(Conf:${finalConfidence.toFixed(1)}%, Rationale:'${rationale}')`,
-            source: "Gemini_Combined_Engine",
-            contributingSignals: activeSignalSources.map(s => ({
-                source: s,
-                prediction: 'LLM_Integrated',
-                weight: signalPerformance[s]?.longTermImportanceScore?.toFixed(5) || 'N/A',
-                isOnProbation: signalPerformance[s]?.isOnProbation || false
-            })).sort((a,b)=>parseFloat(b.weight)-parseFloat(a.weight)).slice(0, 15),
-            currentMacroRegime: currentMacroRegime,
-            marketEntropyState: marketEntropyAnalysis.state,
-            predictionQualityScore: pqs,
-            lastPredictedOutcome: finalDecision,
-            lastFinalConfidence: finalConfidence,
-            lastConfidenceLevel: confidenceLevel,
-            lastMacroRegime: currentMacroRegime,
-            lastPredictionSignals: activeSignalSources.map(s => ({
-                source: s,
-                prediction: 'LLM_Integrated',
-                weight: signalPerformance[s]?.longTermImportanceScore || 0,
-                isOnProbation: signalPerformance[s]?.isOnProbation || false
-            })),
-            lastConcentrationModeEngaged: concentrationModeEngaged,
-            lastMarketEntropyState: marketEntropyAnalysis.state,
-            lastVolatilityRegime: trendContext.volatility,
-            periodFull: nextPeriodFull
-        };
-        console.log(`Combined Prediction Engine Output: ${output.finalDecision} - ${output.number} @ ${(output.finalConfidence).toFixed(1)}% | Lvl: ${output.confidenceLevel} | PQS: ${output.predictionQualityScore.toFixed(2)} | Forced: ${output.isForcedPrediction} | Drift: ${driftState}`);
-        return output;
-    } catch (error) {
-        console.error("Error calling Gemini API or processing response:", error);
-        masterLogic.push(`LLM_Failed_Fallback_DeterministicDefault`);
-        const finalDecision = (BigInt(nextPeriodFull) % 2n === 0n) ? "BIG" : "SMALL";
-        const predictedNumber = finalDecision === 'BIG' ? Math.floor(mulberry32(parseInt(nextPeriodFull.slice(-6)) + 5)() * 5) + 5 : Math.floor(mulberry32(parseInt(nextPeriodFull.slice(-6)))() * 5);
-        return {
-             prediction: finalDecision, number: predictedNumber, finalDecision: finalDecision, finalConfidence: 50, confidenceLevel: 1, isForcedPrediction: true,
-             overallLogic: masterLogic.join(' -> ') + ` -> FALLBACK (LLM Error: ${error.message.substring(0, 50)}...)`, source: "LLM_Fallback", contributingSignals: [], currentMacroRegime,
-             concentrationModeEngaged, predictionQualityScore: 0.01,
-             lastPredictedOutcome: finalDecision, lastFinalConfidence: 50,
-             lastConfidenceLevel: 1, lastMacroRegime: currentMacroRegime, lastPredictionSignals: [], lastConcentrationModeEngaged: concentrationModeEngaged,
-             lastMarketEntropyState: marketEntropyAnalysis.state, lastVolatilityRegime: trendContext.volatility,
-             periodFull: nextPeriodFull
-        };
+    let pqs = 0.5;
+    pqs += (signalConsistency.score - 0.5) * 0.4;
+    pqs += pathConfluence.score * 1.2;
+    pqs = Math.max(0.01, Math.min(0.99, pqs - (uncertainty.score / 500)));
+    masterLogic.push(`PQS:${pqs.toFixed(3)}`);
+
+    const confidenceModelResult = analyzeConfidenceModel(finalDecision, validSignals, consensus, driftState, pqs);
+    let confidenceLevel = confidenceModelResult.finalConfidenceLevel;
+    masterLogic.push(`ConfModel(L${confidenceLevel}-${confidenceModelResult.reason})`);
+
+    const uncertaintyThreshold = isReflexiveCorrection || driftState === 'DRIFT' ? 65 : 95;
+    const isForced = uncertainty.score >= uncertaintyThreshold || pqs < 0.20;
+    if(isForced) {
+        confidenceLevel = 1;
+        finalConfidence = 0.5 + (Math.random() - 0.5) * 0.02;
+        masterLogic.push(`FORCED_PREDICTION(Uncertainty:${uncertainty.score}/${uncertaintyThreshold},PQS:${pqs})`);
     }
+
+    const bigDisplayConfidence = finalDecision === "BIG" ? finalConfidence : 1 - finalConfidence;
+    const smallDisplayConfidence = finalDecision === "SMALL" ? finalConfidence : 1 - finalConfidence;
+
+    const predictionOutput = {
+        predictions: {
+            BIG: { confidence: Math.max(0.001, Math.min(0.999, bigDisplayConfidence)), logic: "EnsembleV44" },
+            SMALL: { confidence: Math.max(0.001, Math.min(0.999, smallDisplayConfidence)), logic: "EnsembleV44" }
+        },
+        finalDecision,
+        finalConfidence,
+        confidenceLevel,
+        isForcedPrediction: isForced,
+        overallLogic: masterLogic.join(' -> '),
+        source: "SimulationFusionV44.2",
+        contributingSignals: validSignals.map(s => ({ source: s.source, prediction: s.prediction, weight: s.adjustedWeight.toFixed(5) })).sort((a,b)=>b.weight-a.weight).slice(0, 15),
+    };
+
+    // This part is for the calling environment to persist the state for the next run.
+    // The main function returns only the prediction object.
+    const newState = {
+        lastPredictedOutcome: finalDecision,
+        lastFinalConfidence: finalConfidence,
+        lastConfidenceLevel: confidenceLevel,
+        lastMacroRegime: currentMacroRegime,
+        lastPredictionSignals: validSignals.map(s => ({ source: s.source, prediction: s.prediction, weight: s.adjustedWeight, isOnProbation: s.isOnProbation || false })),
+        lastConcentrationModeEngaged: concentrationModeEngaged,
+        lastMarketEntropyState: marketEntropyAnalysis.state,
+        lastVolatilityRegime: finalTrendContext.volatility,
+        periodFull: currentPeriodFull,
+        aurochsState: updatedAurochsState,
+        longTermGlobalAccuracy: longTermGlobalAccuracy // Persist this value
+    };
+
+    // This is a key change: update the shared stats object that was passed in.
+    // Assumes the calling environment will persist this object.
+    Object.assign(sharedStatsPayload, newState);
+
+    console.log(`QAScore v44.2.0 Output: ${predictionOutput.finalDecision} @ ${(predictionOutput.finalConfidence * 100).toFixed(1)}% | Lvl: ${predictionOutput.confidenceLevel} | PQS: ${pqs.toFixed(2)} | Drift: ${driftState}`);
+
+    return sanitizeForFirebase(predictionOutput);
 }
 
-// Initial load of state when this script is executed.
-loadPredictionEngineState();
 
-module.exports = { processPredictionCycle };
+if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
+    module.exports = {
+        ultraAIPredict: ultraAIPredict,
+        getBigSmallFromNumber,
+        // Make stateful components accessible for external management if needed
+        signalPerformance,
+        REGIME_SIGNAL_PROFILES
+    }
