@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const path = require('path'); // FIX: This line was missing
 const fs = require('fs');
 const cors = require('cors');
 const { ultraAIPredict } = require('./predictionLogic.js');
@@ -7,16 +8,15 @@ const admin = require('firebase-admin');
 
 // --- Firebase Admin SDK Initialization ---
 try {
-    // FIX: Explicitly providing the projectId to prevent auto-detection issues.
     admin.initializeApp({
         credential: admin.credential.applicationDefault(),
-        projectId: process.env.GCLOUD_PROJECT, // This line directly uses the environment variable
+        projectId: process.env.GCLOUD_PROJECT,
         databaseURL: `https://${process.env.GCLOUD_PROJECT}.firebaseio.com`
     });
     console.log("Firebase Admin SDK initialized successfully.");
 } catch (error) {
     console.error("FATAL: Firebase Admin SDK initialization failed. Ensure GOOGLE_APPLICATION_CREDENTIALS and GCLOUD_PROJECT are set correctly.", error);
-    process.exit(1); // Exit if Firebase can't be initialized
+    process.exit(1);
 }
 
 const db = admin.firestore();
@@ -49,11 +49,11 @@ const requireApiKey = (req, res, next) => {
 
 // --- PATHS & STATE MANAGEMENT ---
 const DATA_DIR = process.env.RENDER_DISK_PATH || __dirname;
-const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json'); // This is now a fallback/legacy path
-const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json'); // This is now a fallback/legacy path
+const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json');
+const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json');
 
-let sharedStats = {}; // This will hold the persistent state for the prediction engine
-app.locals.nextPrediction = null; // Store nextPrediction on the app object
+let sharedStats = {};
+app.locals.nextPrediction = null;
 
 async function loadState() {
     try {
