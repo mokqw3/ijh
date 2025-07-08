@@ -39,7 +39,7 @@ const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json');
 const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json');
 
 let sharedStats = {}; // This will hold the persistent state for the prediction engine
-app.locals.nextPrediction = null; // FIX: Store nextPrediction on the app object
+app.locals.nextPrediction = null; // Store nextPrediction on the app object
 
 function loadState() {
     if (fs.existsSync(APP_STATE_PATH)) {
@@ -96,11 +96,10 @@ async function mainCycle() {
             const newEntry = {
                 period: String(latestGameResult.issueNumber),
                 actual: latestGameResult.number,
-                actualNumber: latestGameResult.number, // Ensure this field exists
-                status: 'resolved' // Mark as resolved since we have the outcome
+                actualNumber: latestGameResult.number, 
+                status: 'resolved'
             };
 
-            // Update the shared stats with the actual outcome of the last prediction
             if (sharedStats.lastPredictedOutcome) {
                  sharedStats.lastActualOutcome = newEntry.actual;
             }
@@ -110,20 +109,17 @@ async function mainCycle() {
             fs.writeFileSync(GAME_DATA_PATH, JSON.stringify(gameDataStore, null, 2));
             console.log(`Stored new game result for period ${latestGameResult.issueNumber}`);
 
-            // Now, run the prediction for the *next* period
             const nextPeriod = (BigInt(latestGameResult.issueNumber) + 1n).toString();
             console.log(`Running prediction for next period: ${nextPeriod}`);
             
-            // The ultraAIPredict function now MUTATES the sharedStats object directly
             const prediction = ultraAIPredict(gameDataStore.history, sharedStats);
             
-            // Store the new prediction in our server's state
-            app.locals.nextPrediction = { // FIX: Store on app.locals
+            app.locals.nextPrediction = {
                 period: nextPeriod,
                 ...prediction
             };
             
-            saveState(); // Save the mutated sharedStats
+            saveState();
         }
     } catch (error) {
         console.error('Main cycle failed:', error);
@@ -134,11 +130,10 @@ setInterval(mainCycle, 30000);
 
 // --- API ENDPOINTS ---
 app.get('/predict', requireApiKey, (req, res) => {
-    if (app.locals.nextPrediction) { // FIX: Read from app.locals
+    if (app.locals.nextPrediction) {
         res.json({
             period: app.locals.nextPrediction.period,
             finalDecision: app.locals.nextPrediction.finalDecision,
-            // Convert confidence from 0-1 range to 0-100 for the frontend
             finalConfidence: app.locals.nextPrediction.finalConfidence * 100, 
         });
     } else {
@@ -172,6 +167,22 @@ app.get('/game-data', requireApiKey, (req, res) => {
         res.status(404).json({ history: [] });
     }
 });
+
+// NEW: Endpoint to get the status and data count
+app.get('/status', requireApiKey, (req, res) => {
+    if (!fs.existsSync(GAME_DATA_PATH)) {
+        return res.json({ collectedDataCount: 0 });
+    }
+    try {
+        const gameDataStore = JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8'));
+        const count = gameDataStore.history?.length || 0;
+        res.json({ collectedDataCount: count });
+    } catch (error) {
+        console.error(`Error in /status:`, error);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
 
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
