@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const path = require('path'); // FIX: This line was missing
+const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 const { ultraAIPredict } = require('./predictionLogic.js');
@@ -8,14 +8,15 @@ const admin = require('firebase-admin');
 
 // --- Firebase Admin SDK Initialization ---
 try {
+    // FIX: Explicitly providing the projectId to prevent auto-detection issues.
     admin.initializeApp({
         credential: admin.credential.applicationDefault(),
-        projectId: process.env.GCLOUD_PROJECT,
-        databaseURL: `https://${process.env.GCLOUD_PROJECT}.firebaseio.com`
+        projectId: 'webut-83a0f', // This line directly uses your Project ID for maximum reliability
+        databaseURL: 'https://webut-83a0f.firebaseio.com'
     });
     console.log("Firebase Admin SDK initialized successfully.");
 } catch (error) {
-    console.error("FATAL: Firebase Admin SDK initialization failed. Ensure GOOGLE_APPLICATION_CREDENTIALS and GCLOUD_PROJECT are set correctly.", error);
+    console.error("FATAL: Firebase Admin SDK initialization failed. Ensure GOOGLE_APPLICATION_CREDENTIALS is set correctly.", error);
     process.exit(1);
 }
 
