@@ -10,7 +10,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- CORS Configuration ---
-const allowedOrigin = process.env.ALLOWED_ORIGIN || '*';
+const allowedOrigin = process.env.ALLOWED_ORIGIN || '*'; 
 const corsOptions = {
   origin: allowedOrigin
 };
@@ -126,7 +126,8 @@ async function mainCycle() {
     }
 }
 
-setInterval(mainCycle, 30000);
+// Fetch data every 10 seconds for faster updates
+setInterval(mainCycle, 10000); 
 
 // --- API ENDPOINTS ---
 app.get('/predict', requireApiKey, (req, res) => {
@@ -168,7 +169,6 @@ app.get('/game-data', requireApiKey, (req, res) => {
     }
 });
 
-// NEW: Endpoint to get the status and data count
 app.get('/status', requireApiKey, (req, res) => {
     if (!fs.existsSync(GAME_DATA_PATH)) {
         return res.json({ collectedDataCount: 0 });
