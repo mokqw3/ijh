@@ -4,23 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 const { ultraAIPredict } = require('./predictionLogic.js');
-const admin = require('firebase-admin');
 
-// --- Firebase Admin SDK Initialization ---
-try {
-    // FIX: Explicitly providing the projectId to prevent auto-detection issues.
-    admin.initializeApp({
-        credential: admin.credential.applicationDefault(),
-        projectId: 'webut-83a0f', // This line directly uses your Project ID for maximum reliability
-        databaseURL: 'https://webut-83a0f.firebaseio.com'
-    });
-    console.log("Firebase Admin SDK initialized successfully.");
-} catch (error) {
-    console.error("FATAL: Firebase Admin SDK initialization failed. Ensure GOOGLE_APPLICATION_CREDENTIALS is set correctly.", error);
-    process.exit(1);
-}
-
-const db = admin.firestore();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -48,37 +32,32 @@ const requireApiKey = (req, res, next) => {
   next();
 };
 
-// --- PATHS & STATE MANAGEMENT ---
+// --- PATHS & STATE MANAGEMENT (using local JSON files) ---
 const DATA_DIR = process.env.RENDER_DISK_PATH || __dirname;
 const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json');
 const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json');
 
-let sharedStats = {};
-app.locals.nextPrediction = null;
+app.locals.sharedStats = {}; // This will hold the persistent state for the prediction engine
+app.locals.nextPrediction = null; 
 
-async function loadState() {
-    try {
-        const stateRef = db.collection('app-state').doc('main');
-        const doc = await stateRef.get();
-        if (doc.exists) {
-            app.locals.sharedStats = doc.data();
-            console.log("Prediction engine state loaded from Firestore.");
-        } else {
-            console.log("No prediction state found in Firestore, starting fresh.");
+function loadState() {
+    if (fs.existsSync(APP_STATE_PATH)) {
+        try {
+            const rawData = fs.readFileSync(APP_STATE_PATH, 'utf8');
+            app.locals.sharedStats = JSON.parse(rawData);
+            console.log("Prediction engine state loaded from appState.json.");
+        } catch (error) {
+            console.error("Could not load prediction state, starting fresh.", error);
             app.locals.sharedStats = {};
         }
-    } catch (error) {
-        console.error("Could not load prediction state from Firestore, starting fresh.", error);
-        app.locals.sharedStats = {};
     }
 }
 
-async function saveState() {
+function saveState() {
     try {
-        const stateRef = db.collection('app-state').doc('main');
-        await stateRef.set(app.locals.sharedStats);
+        fs.writeFileSync(APP_STATE_PATH, JSON.stringify(app.locals.sharedStats, null, 2));
     } catch (error) {
-        console.error("Failed to save prediction state to Firestore:", error);
+        console.error("Failed to save prediction state:", error);
     }
 }
 
@@ -109,49 +88,37 @@ async function mainCycle() {
         if (!apiData?.data?.list?.length) return;
 
         const latestGameResult = apiData.data.list[0];
-        const periodId = String(latestGameResult.issueNumber);
-        const gameResultRef = db.collection('game-history').doc(periodId);
-        
-        const doc = await gameResultRef.get();
-        if (!doc.exists) {
-            await gameResultRef.set(latestGameResult);
-            console.log(`Stored new game result for period ${periodId}`);
+        const gameDataStore = fs.existsSync(GAME_DATA_PATH) ? JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8')) : { history: [] };
 
-            const historySnapshot = await db.collection('game-history').orderBy('issueNumber', 'desc').limit(200).get();
-            const history = historySnapshot.docs.map(doc => doc.data());
+        if (!gameDataStore.history.some(h => h.issueNumber === latestGameResult.issueNumber)) {
             
             if (app.locals.sharedStats.lastPredictedOutcome) {
                  app.locals.sharedStats.lastActualOutcome = latestGameResult.number;
             }
 
-            const nextPeriod = (BigInt(periodId) + 1n).toString();
+            gameDataStore.history.unshift(latestGameResult);
+            // No limit on history size, it will grow indefinitely
+            fs.writeFileSync(GAME_DATA_PATH, JSON.stringify(gameDataStore, null, 2));
+            console.log(`Stored new game result for period ${latestGameResult.issueNumber}. Total records: ${gameDataStore.history.length}`);
+
+            const nextPeriod = (BigInt(latestGameResult.issueNumber) + 1n).toString();
             console.log(`Running prediction for next period: ${nextPeriod}`);
             
-            const prediction = ultraAIPredict(history, app.locals.sharedStats);
+            const prediction = ultraAIPredict(gameDataStore.history, app.locals.sharedStats);
             
             app.locals.nextPrediction = {
                 period: nextPeriod,
                 ...prediction
             };
             
-            await saveState();
-
-            const countSnapshot = await db.collection('game-history').count().get();
-            const count = countSnapshot.data().count;
-            if (count > 50000) {
-                const oldDocsSnapshot = await db.collection('game-history').orderBy('issueNumber', 'asc').limit(count - 50000).get();
-                const batch = db.batch();
-                oldDocsSnapshot.docs.forEach(doc => batch.delete(doc.ref));
-                await batch.commit();
-                console.log(`Pruned ${oldDocsSnapshot.size} old records.`);
-            }
+            saveState();
         }
     } catch (error) {
         console.error('Main cycle failed:', error);
     }
 }
 
-setInterval(mainCycle, 10000);
+setInterval(mainCycle, 20000);
 
 // --- API ENDPOINTS ---
 app.get('/predict', requireApiKey, (req, res) => {
@@ -166,16 +133,16 @@ app.get('/predict', requireApiKey, (req, res) => {
     }
 });
 
-app.get('/get-result', requireApiKey, async (req, res) => {
+app.get('/get-result', requireApiKey, (req, res) => {
     const { period } = req.query;
     if (!period) return res.status(400).json({ error: 'Period query parameter is required.' });
+    if (!fs.existsSync(GAME_DATA_PATH)) return res.status(404).json({ error: 'Game data file not found.' });
     
     try {
-        const docRef = db.collection('game-history').doc(String(period));
-        const doc = await docRef.get();
-        if (doc.exists) {
-            const data = doc.data();
-            res.json({ period: data.issueNumber, number: data.number });
+        const gameDataStore = JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8'));
+        const result = gameDataStore.history.find(item => String(item.issueNumber) === String(period));
+        if (result) {
+            res.json({ period: result.issueNumber, number: result.number });
         } else {
             res.status(404).json({ error: `Result for period ${period} not found.` });
         }
@@ -185,21 +152,22 @@ app.get('/get-result', requireApiKey, async (req, res) => {
     }
 });
 
-app.get('/game-data', requireApiKey, async (req, res) => {
-    try {
-        const snapshot = await db.collection('game-history').orderBy('issueNumber', 'desc').limit(200).get();
-        const history = snapshot.docs.map(doc => doc.data());
-        res.json({ history });
-    } catch (error) {
-         console.error(`Error in /game-data:`, error);
-        res.status(500).json({ error: 'Internal server error.' });
+app.get('/game-data', requireApiKey, (req, res) => {
+    if (fs.existsSync(GAME_DATA_PATH)) {
+        res.sendFile(GAME_DATA_PATH);
+    } else {
+        res.status(404).json({ history: [] });
     }
 });
 
-app.get('/status', requireApiKey, async (req, res) => {
+app.get('/status', requireApiKey, (req, res) => {
+    if (!fs.existsSync(GAME_DATA_PATH)) {
+        return res.json({ collectedDataCount: 0 });
+    }
     try {
-        const snapshot = await db.collection('game-history').count().get();
-        res.json({ collectedDataCount: snapshot.data().count });
+        const gameDataStore = JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8'));
+        const count = gameDataStore.history?.length || 0;
+        res.json({ collectedDataCount: count });
     } catch (error) {
         console.error(`Error in /status:`, error);
         res.status(500).json({ error: 'Internal server error.' });
