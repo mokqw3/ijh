@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
 const { ultraAIPredict } = require('./predictionLogic.js');
+const fetch = require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -37,7 +38,12 @@ const DATA_DIR = process.env.RENDER_DISK_PATH || __dirname;
 const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json');
 const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json');
 
-app.locals.sharedStats = {}; // This will hold the persistent state for the prediction engine
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    console.log(`Created data directory at: ${DATA_DIR}`);
+}
+
+app.locals.sharedStats = {};
 app.locals.nextPrediction = null; 
 
 function loadState() {
@@ -63,31 +69,27 @@ function saveState() {
 
 // --- Main Data & Prediction Cycle ---
 async function mainCycle() {
-    console.log('Fetching latest game data...');
+    console.log('Fetching latest game data from new data collector...');
     try {
+        // NEW: Fetching from your dedicated data collector service
         const response = await fetch(
-            "https://api.fantasygamesapi.com/api/webapi/GetNoaverageEmerdList",
+            "https://datacollectorserver-gqe1.onrender.com/game-data",
             {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    pageSize: 10,
-                    pageNo: 1,
-                    typeId: 1,
-                    language: 0,
-                    random: "4a0522c6ecd8410496260e686be2a57c",
-                    signature: "334B5E70A0C9B8918B0B15E517E2069C",
-                    timestamp: Math.floor(Date.now() / 1000),
-                }),
+                method: "GET",
+                headers: { 
+                    "Content-Type": "application/json",
+                    "x-api-key": "a4e8f1b2-9c3d-4a7f-8b1e-6f2c3d4a5b6c-internal" // Using your internal key
+                }
             }
         );
 
-        if (!response.ok) throw new Error(`API responded with status: ${response.status}`);
+        if (!response.ok) throw new Error(`Data Collector API responded with status: ${response.status}`);
 
         const apiData = await response.json();
-        if (!apiData?.data?.list?.length) return;
+        // Assuming the new API returns data in the format { history: [...] }
+        if (!apiData?.history?.length) return;
 
-        const latestGameResult = apiData.data.list[0];
+        const latestGameResult = apiData.history[0];
         const gameDataStore = fs.existsSync(GAME_DATA_PATH) ? JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8')) : { history: [] };
 
         if (!gameDataStore.history.some(h => h.issueNumber === latestGameResult.issueNumber)) {
@@ -96,11 +98,11 @@ async function mainCycle() {
                  app.locals.sharedStats.lastActualOutcome = latestGameResult.number;
             }
 
-            gameDataStore.history.unshift(latestGameResult);
-            // No limit on history size, it will grow indefinitely
+            // The entire history from the collector becomes our current history
+            gameDataStore.history = apiData.history;
             fs.writeFileSync(GAME_DATA_PATH, JSON.stringify(gameDataStore, null, 2));
-            console.log(`Stored new game result for period ${latestGameResult.issueNumber}. Total records: ${gameDataStore.history.length}`);
-
+            console.log(`Updated game data with ${gameDataStore.history.length} records from collector.`);
+            
             const nextPeriod = (BigInt(latestGameResult.issueNumber) + 1n).toString();
             console.log(`Running prediction for next period: ${nextPeriod}`);
             
@@ -119,6 +121,15 @@ async function mainCycle() {
 }
 
 setInterval(mainCycle, 20000);
+
+// --- Keep-Alive Function ---
+const keepAlive = () => {
+    const serviceUrl = process.env.RENDER_EXTERNAL_URL;
+    if (serviceUrl) {
+        fetch(serviceUrl).then(() => console.log(`Keep-alive ping sent to ${serviceUrl}`)).catch(err => console.error("Keep-alive ping failed:", err));
+    }
+};
+setInterval(keepAlive, 14 * 60 * 1000);
 
 // --- API ENDPOINTS ---
 app.get('/predict', requireApiKey, (req, res) => {
