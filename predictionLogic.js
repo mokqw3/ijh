@@ -7,6 +7,9 @@
 // - ADDED: Global getSignalCategory helper for consistent signal categorization.
 // - IMPROVED: Enhanced comments and logging for new features.
 
+// ADDED: This is required to use 'fetch' in a Node.js environment
+const fetch = require('node-fetch');
+
 let isMlModelLoading = false; // Simple flag to indicate if an ML prediction is in progress
 
 // --- Helper Functions ---
@@ -1558,6 +1561,18 @@ function createFeatureSetForML(history, trendContext, time) {
 async function ultraAIPredict(currentSharedHistory, sharedStatsPayload = {}) {
     let currentSharedStats = sharedStatsPayload;
 
+    // If the prediction logic state exists, load it.
+    if(currentSharedStats.signalPerformance) {
+        signalPerformance = currentSharedStats.signalPerformance;
+    }
+    if(currentSharedStats.driftDetector) {
+        driftDetector = currentSharedStats.driftDetector;
+    }
+    if(currentSharedStats.regimeSignalProfiles) {
+        REGIME_SIGNAL_PROFILES = currentSharedStats.regimeSignalProfiles;
+    }
+
+
     const currentPeriodFull = Date.now(); // Unique identifier for the current prediction period
     const time = getCurrentISTHour();
 
@@ -1637,17 +1652,6 @@ async function ultraAIPredict(currentSharedHistory, sharedStatsPayload = {}) {
             currentSharedStats.lastConcentrationModeEngaged || false,
             currentSharedStats.lastMarketEntropyState || "STABLE_MODERATE"
         );
-
-        // ML model accuracy check (for potential future retraining triggers, currently just for logging)
-        const mlSignalsInLastCycle = currentSharedStats.lastPredictionSignals.filter(s => s.source.startsWith('ML-'));
-        if (mlSignalsInLastCycle.length > 0) {
-            const correctMLPredictions = mlSignalsInLastCycle.filter(s => s.prediction === getBigSmallFromNumber(currentSharedStats.lastActualOutcome)).length;
-            // This accuracy can be used to inform future ML model behavior or actual retraining
-            // mlModelTrainingState.lastAccuracy = correctMLPredictions / mlSignalsInLastCycle.length;
-            // if (mlModelTrainingState.lastAccuracy < mlModelTrainingState.minAccuracyForNoRetrain) {
-            //     triggerMLModelRetraining("LOW_ML_ACCURACY");
-            // }
-        }
 
         if (currentSharedStats.lastPredictedOutcome) {
             updateRegimeProfilePerformance(currentSharedStats.lastMacroRegime, getBigSmallFromNumber(currentSharedStats.lastActualOutcome), currentSharedStats.lastPredictedOutcome);
@@ -1777,7 +1781,7 @@ async function ultraAIPredict(currentSharedHistory, sharedStatsPayload = {}) {
             const originalWeight = s.adjustedWeight;
             s.adjustedWeight *= contextualSignalAdjustments[category];
             s.logic = (s.logic || s.source) + ` (CtxAdj:${contextualSignalAdjustments[category].toFixed(2)})`; // Add to logic for debugging
-            console.log(`Signal ${s.source} (${category}): Original Weight ${originalWeight.toFixed(5)}, Adjusted to ${s.adjustedWeight.toFixed(5)}`);
+            // console.log(`Signal ${s.source} (${category}): Original Weight ${originalWeight.toFixed(5)}, Adjusted to ${s.adjustedWeight.toFixed(5)}`);
         }
     });
     masterLogic.push(`ContextualAdjustmentApplied`);
@@ -1814,20 +1818,20 @@ async function ultraAIPredict(currentSharedHistory, sharedStatsPayload = {}) {
     const pathConfluence = analyzePathConfluenceStrength(validSignals, finalDecision);
     masterLogic.push(`LAYER 9: Signal Consistency & Path Confluence (Consistency:${signalConsistency.score.toFixed(2)}, Confluence:${pathConfluence.score.toFixed(2)})`);
     
-    // Calculate overall uncertainty score and modulate final confidence
-    // PQS is now passed to calculateUncertaintyScore to reduce uncertainty if PQS is high
-    const uncertainty = calculateUncertaintyScore(trendContext, stability, marketEntropyAnalysis, signalConsistency, pathConfluence, longTermGlobalAccuracy, isReflexiveCorrection, driftState, pqs);
-    // Uncertainty factor now considers PQS: higher PQS means less impact from general uncertainty
-    const uncertaintyFactor = 1.0 - Math.min(1.0, uncertainty.score / (120.0 + pqs * 50)); // PQS can reduce the effective uncertainty score threshold
-    finalConfidence = 0.5 + (finalConfidence - 0.5) * uncertaintyFactor;
-    masterLogic.push(`LAYER 10: Uncertainty Modulation & Final Calibration (Uncertainty Score:${uncertainty.score.toFixed(0)}, Factor:${uncertaintyFactor.toFixed(2)}; Reasons:${uncertainty.reasons})`);
-
     // Calculate Prediction Quality Score (PQS)
     let pqs = 0.5;
     pqs += (signalConsistency.score - 0.5) * 0.4; // Higher consistency, higher PQS
     pqs += pathConfluence.score * 1.2; // Higher confluence, higher PQS
-    pqs = Math.max(0.01, Math.min(0.99, pqs - (uncertainty.score / 500))); // Reduce PQS based on overall uncertainty
+    const uncertaintyForPqs = calculateUncertaintyScore(trendContext, stability, marketEntropyAnalysis, signalConsistency, pathConfluence, longTermGlobalAccuracy, isReflexiveCorrection, driftState, 0.5);
+    pqs = Math.max(0.01, Math.min(0.99, pqs - (uncertaintyForPqs.score / 500))); // Reduce PQS based on overall uncertainty
     masterLogic.push(`PQS:${pqs.toFixed(3)}`);
+
+    // Calculate overall uncertainty score and modulate final confidence
+    const uncertainty = calculateUncertaintyScore(trendContext, stability, marketEntropyAnalysis, signalConsistency, pathConfluence, longTermGlobalAccuracy, isReflexiveCorrection, driftState, pqs);
+    const uncertaintyFactor = 1.0 - Math.min(1.0, uncertainty.score / (120.0 + pqs * 50)); // PQS can reduce the effective uncertainty score threshold
+    finalConfidence = 0.5 + (finalConfidence - 0.5) * uncertaintyFactor;
+    masterLogic.push(`LAYER 10: Uncertainty Modulation & Final Calibration (Uncertainty Score:${uncertainty.score.toFixed(0)}, Factor:${uncertaintyFactor.toFixed(2)}; Reasons:${uncertainty.reasons})`);
+
 
     // Define confidence level thresholds, adjusted for prime time
     let highConfThreshold = 0.78, medConfThreshold = 0.65;
@@ -1872,12 +1876,10 @@ async function ultraAIPredict(currentSharedHistory, sharedStatsPayload = {}) {
         isForcedPrediction: isForced,
         overallLogic: masterLogic.join(' -> '),
         source: "RealTimeFusionV46.0.3",
-        // Limit contributing signals for output clarity
         contributingSignals: validSignals.map(s => ({ source: s.source, prediction: s.prediction, weight: s.adjustedWeight.toFixed(5), logic: s.logic || '' })).sort((a,b)=>b.weight-a.weight).slice(0, 15),
         currentMacroRegime,
         marketEntropyState: marketEntropyAnalysis.state,
         predictionQualityScore: pqs,
-        // Store last state for next prediction cycle
         lastPredictedOutcome: finalDecision,
         lastFinalConfidence: finalConfidence,
         lastConfidenceLevel: confidenceLevel,
@@ -1886,8 +1888,12 @@ async function ultraAIPredict(currentSharedHistory, sharedStatsPayload = {}) {
         lastConcentrationModeEngaged: concentrationModeEngaged,
         lastMarketEntropyState: marketEntropyAnalysis.state,
         lastVolatilityRegime: trendContext.volatility,
-        periodFull: currentPeriodFull, // Store the period ID for performance tracking
-        aurochsState: updatedAurochsState // Store updated aurochs state
+        periodFull: currentPeriodFull,
+        aurochsState: updatedAurochsState,
+        // Persist the learning states
+        signalPerformance: signalPerformance,
+        driftDetector: driftDetector,
+        regimeSignalProfiles: REGIME_SIGNAL_PROFILES
     };
 
     console.log(`QAScore v46.0.3 Output: ${output.finalDecision} @ ${(output.finalConfidence * 100).toFixed(1)}% | Lvl: ${output.confidenceLevel} | PQS: ${output.predictionQualityScore.toFixed(2)} | Forced: ${output.isForcedPrediction} | Drift: ${driftState}`);
