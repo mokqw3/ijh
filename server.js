@@ -1,30 +1,44 @@
-require('dotenv').config();
+require('dotenv').config(); // Loads .env file for local development
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
-const { ultraAIPredict } = require('./predictionLogic.js');
-const fetch = require('node-fetch');
+const { processPredictionCycle } = require('./predictionLogic.js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- CORS Configuration ---
-const allowedOrigin = process.env.ALLOWED_ORIGIN || '*'; 
+// This allows your frontend to make requests to this server.
+const allowedOrigin = process.env.ALLOWED_ORIGIN || '*'; // Use '*' for development if needed, but be specific in production
 const corsOptions = {
   origin: allowedOrigin
 };
 app.use(cors(corsOptions));
+
+
+// --- PATHS FOR DATA PERSISTENCE ---
+const DATA_DIR = process.env.RENDER_DISK_PATH || __dirname;
+const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json');
+const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json');
+
+// Ensure the data directory exists
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    console.log(`Created data directory at: ${DATA_DIR}`);
+}
+
 app.use(express.json());
 
 // --- API Key Middleware ---
+// This middleware protects your endpoints.
 const requireApiKey = (req, res, next) => {
   const apiKey = req.get('X-API-Key');
   const serverApiKey = process.env.API_KEY;
 
   if (!serverApiKey) {
-      console.error("FATAL: API_KEY environment variable is not set on the server.");
-      return res.status(500).json({ error: 'Server configuration error: API Key not set.' });
+      console.error("API_KEY environment variable is not set on the server.");
+      return res.status(500).json({ error: 'Server configuration error.' });
   }
 
   if (!apiKey || apiKey !== serverApiKey) {
@@ -33,42 +47,37 @@ const requireApiKey = (req, res, next) => {
   next();
 };
 
-// --- PATHS & STATE MANAGEMENT (using local JSON files on a persistent disk) ---
-const DATA_DIR = process.env.RENDER_DISK_PATH || __dirname;
-const GAME_DATA_PATH = path.join(DATA_DIR, 'gameData.json');
-const APP_STATE_PATH = path.join(DATA_DIR, 'appState.json');
 
-// Ensure the data directory exists on startup
-if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    console.log(`Created data directory at: ${DATA_DIR}`);
-}
+// --- APPLICATION STATE MANAGEMENT ---
+let appState = {
+    historyData: [],
+    lastProcessedPeriodId: null,
+    currentSystemLosses: 0,
+    nextPrediction: null
+};
 
-app.locals.sharedStats = {};
-app.locals.nextPrediction = null; 
-
-function loadState() {
+function loadAppState() {
     if (fs.existsSync(APP_STATE_PATH)) {
         try {
             const rawData = fs.readFileSync(APP_STATE_PATH, 'utf8');
-            app.locals.sharedStats = JSON.parse(rawData);
-            console.log("Prediction engine state loaded from appState.json.");
+            appState = JSON.parse(rawData);
+            console.log("Application state loaded successfully.");
         } catch (error) {
-            console.error("Could not load prediction state, starting fresh.", error);
-            app.locals.sharedStats = {};
+            console.error("Could not load app state, starting fresh.", error);
+            appState = { historyData: [], lastProcessedPeriodId: null, currentSystemLosses: 0, nextPrediction: null };
         }
     }
 }
 
-function saveState() {
+function saveAppState() {
     try {
-        fs.writeFileSync(APP_STATE_PATH, JSON.stringify(app.locals.sharedStats, null, 2));
+        fs.writeFileSync(APP_STATE_PATH, JSON.stringify(appState, null, 2));
     } catch (error) {
-        console.error("Failed to save prediction state:", error);
+        console.error("Failed to save app state:", error);
     }
 }
 
-// --- Main Data & Prediction Cycle ---
+// --- DATA COLLECTION & PREDICTION CYCLE ---
 async function mainCycle() {
     console.log('Fetching latest game data...');
     try {
@@ -89,73 +98,85 @@ async function mainCycle() {
             }
         );
 
-        if (!response.ok) throw new Error(`API responded with status: ${response.status}`);
+        if (!response.ok) {
+            throw new Error(`API responded with status: ${response.status}`);
+        }
 
         const apiData = await response.json();
-        if (!apiData?.data?.list?.length) return;
+        
+        if (apiData && apiData.data && apiData.data.list && apiData.data.list.length > 0) {
+            const latestGameResult = apiData.data.list[0];
 
-        const latestGameResult = apiData.data.list[0];
-        const gameDataStore = fs.existsSync(GAME_DATA_PATH) ? JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8')) : { history: [] };
-
-        if (!gameDataStore.history.some(h => h.issueNumber === latestGameResult.issueNumber)) {
-            
-            if (app.locals.sharedStats.lastPredictedOutcome) {
-                 app.locals.sharedStats.lastActualOutcome = latestGameResult.number;
+            const gameDataStore = fs.existsSync(GAME_DATA_PATH) ? JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8')) : { history: [] };
+            if (!gameDataStore.history.some(h => h.issueNumber === latestGameResult.issueNumber)) {
+                gameDataStore.history.unshift(latestGameResult);
+                gameDataStore.history = gameDataStore.history.slice(0, 5000);
+                fs.writeFileSync(GAME_DATA_PATH, JSON.stringify(gameDataStore, null, 2));
+                console.log(`Stored new game result for period ${latestGameResult.issueNumber}`);
             }
-
-            gameDataStore.history.unshift(latestGameResult);
-            fs.writeFileSync(GAME_DATA_PATH, JSON.stringify(gameDataStore, null, 2));
-            console.log(`Stored new game result for period ${latestGameResult.issueNumber}. Total records: ${gameDataStore.history.length}`);
             
-            const nextPeriod = (BigInt(latestGameResult.issueNumber) + 1n).toString();
-            console.log(`Running prediction for next period: ${nextPeriod}`);
-            
-            const prediction = ultraAIPredict(gameDataStore.history, app.locals.sharedStats);
-            
-            app.locals.nextPrediction = {
-                period: nextPeriod,
-                ...prediction
-            };
-            
-            saveState();
+            if (String(latestGameResult.issueNumber) !== appState.lastProcessedPeriodId) {
+                console.log(`New period detected. Old: ${appState.lastProcessedPeriodId}, New: ${latestGameResult.issueNumber}. Running prediction cycle.`);
+                
+                const result = await processPredictionCycle(latestGameResult, appState.historyData, appState.lastProcessedPeriodId);
+                
+                if (result) {
+                    appState.historyData = result.updatedHistoryData;
+                    appState.lastProcessedPeriodId = result.lastProcessedPeriodId;
+                    appState.currentSystemLosses = result.updatedSystemLosses;
+                    appState.nextPrediction = {
+                        prediction: result.nextPeriodPrediction,
+                        number: result.nextPeriodPredictedNumber,
+                        confidence: result.nextPeriodConfidence,
+                        rationale: result.rationale
+                    };
+                    saveAppState();
+                    console.log(`Prediction generated for next period: ${appState.nextPrediction.prediction} with ${appState.nextPrediction.confidence}% confidence.`);
+                }
+            } else {
+                console.log(`Period ${latestGameResult.issueNumber} already processed. Waiting for next.`);
+            }
         }
     } catch (error) {
         console.error('Main cycle failed:', error);
     }
 }
 
-setInterval(mainCycle, 20000);
-
-// --- Keep-Alive Function ---
-const keepAlive = () => {
-    const serviceUrl = process.env.RENDER_EXTERNAL_URL;
-    if (serviceUrl) {
-        fetch(serviceUrl + '/ping').then(() => console.log(`Keep-alive ping sent to ${serviceUrl}`)).catch(err => console.error("Keep-alive ping failed:", err));
-    }
-};
-setInterval(keepAlive, 14 * 60 * 1000);
+// Run the main cycle every 30 seconds.
+setInterval(mainCycle, 30000);
 
 // --- API ENDPOINTS ---
+
+// FIX: Changed to GET and now returns the period number with the prediction.
 app.get('/predict', requireApiKey, (req, res) => {
-    if (app.locals.nextPrediction) {
+    if (appState.nextPrediction && appState.lastProcessedPeriodId) {
+        const nextPeriod = (BigInt(appState.lastProcessedPeriodId) + 1n).toString();
         res.json({
-            period: app.locals.nextPrediction.period,
-            finalDecision: app.locals.nextPrediction.finalDecision,
-            finalConfidence: app.locals.nextPrediction.finalConfidence * 100, 
+            period: nextPeriod,
+            finalDecision: appState.nextPrediction.prediction,
+            finalConfidence: appState.nextPrediction.confidence,
         });
     } else {
         res.status(404).json({ error: 'Prediction not available yet. Please wait for the next cycle.' });
     }
 });
 
+// NEW: Added this endpoint to allow the frontend to check for results.
 app.get('/get-result', requireApiKey, (req, res) => {
     const { period } = req.query;
-    if (!period) return res.status(400).json({ error: 'Period query parameter is required.' });
-    if (!fs.existsSync(GAME_DATA_PATH)) return res.status(404).json({ error: 'Game data file not found.' });
-    
+
+    if (!period) {
+        return res.status(400).json({ error: 'Period query parameter is required.' });
+    }
+
+    if (!fs.existsSync(GAME_DATA_PATH)) {
+        return res.status(404).json({ error: 'Game data file not found.' });
+    }
+
     try {
         const gameDataStore = JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8'));
         const result = gameDataStore.history.find(item => String(item.issueNumber) === String(period));
+
         if (result) {
             res.json({ period: result.issueNumber, number: result.number });
         } else {
@@ -167,6 +188,7 @@ app.get('/get-result', requireApiKey, (req, res) => {
     }
 });
 
+
 app.get('/game-data', requireApiKey, (req, res) => {
     if (fs.existsSync(GAME_DATA_PATH)) {
         res.sendFile(GAME_DATA_PATH);
@@ -175,26 +197,8 @@ app.get('/game-data', requireApiKey, (req, res) => {
     }
 });
 
-app.get('/status', requireApiKey, (req, res) => {
-    if (!fs.existsSync(GAME_DATA_PATH)) {
-        return res.json({ collectedDataCount: 0 });
-    }
-    try {
-        const gameDataStore = JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8'));
-        const count = gameDataStore.history?.length || 0;
-        res.json({ collectedDataCount: count });
-    } catch (error) {
-        console.error(`Error in /status:`, error);
-        res.status(500).json({ error: 'Internal server error.' });
-    }
-});
-
-app.get('/ping', (req, res) => {
-    res.status(200).send('pong');
-});
-
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
-    loadState();
-    mainCycle(); 
+    loadAppState();
+    mainCycle(); // Run once on startup
 });
