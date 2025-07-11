@@ -3,10 +3,9 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
-const fetch = require('node-fetch'); // <-- ADDED: Required for making HTTP requests in Node.js
+const fetch = require('node-fetch'); // Required for making HTTP requests in Node.js
 
 // IMPORTANT: Make sure you have renamed 'predictionLogic.js - Quantum AI Su.txt' to 'predictionLogic.js'
-// The new prediction logic exports 'ultraAIPredict', not 'processPredictionCycle'.
 const { ultraAIPredict } = require('./predictionLogic.js');
 
 const app = express();
@@ -37,6 +36,7 @@ app.use(express.json());
 const requireApiKey = (req, res, next) => {
   const apiKey = req.get('X-API-Key');
   // Use the PUBLIC_API_KEY for client-facing endpoints
+  // It's best to set this in your Render environment variables.
   const serverApiKey = process.env.PUBLIC_API_KEY || 'b5f9c2a1-8d4e-5b8g-9c2f-7g3d4e5f6a7b-public';
 
   if (!serverApiKey) {
@@ -52,7 +52,6 @@ const requireApiKey = (req, res, next) => {
 
 
 // --- APPLICATION STATE MANAGEMENT ---
-// UPDATED: The state structure is changed to work with the new prediction logic.
 let appState = {
     lastProcessedPeriodId: null,
     predictionState: {}, // This will hold the entire state object for ultraAIPredict
@@ -67,7 +66,6 @@ function loadAppState() {
             console.log("Application state loaded successfully.");
         } catch (error) {
             console.error("Could not load app state, starting fresh.", error);
-            // Reset to the default state structure
             appState = { lastProcessedPeriodId: null, predictionState: {}, nextPrediction: null };
         }
     }
@@ -82,20 +80,19 @@ function saveAppState() {
 }
 
 // --- DATA COLLECTION & PREDICTION CYCLE ---
-// REFACTORED: The main cycle is updated to use the new URL and prediction logic.
 async function mainCycle() {
     console.log('Fetching latest game data from data collector server...');
     try {
-        // UPDATED: Fetching from the user's data collector server.
-        // We assume the endpoint is /game-data. The user should change this if it's different.
+        // Fetching from your data collector server.
+        // The INTERNAL_API_KEY should be set in your Render environment variables.
+        const internalApiKey = process.env.INTERNAL_API_KEY || "a4e8f1b2-9c3d-4a7f-8b1e-6f2c3d4a5b6c-internal";
         const response = await fetch(
             "https://datacollectorserver-gqe1.onrender.com/game-data",
             {
-                method: "GET", // Changed from POST to GET
+                method: "GET",
                 headers: {
                     "Content-Type": "application/json",
-                    // Using the internal API key for server-to-server communication
-                    "X-API-Key": process.env.INTERNAL_API_KEY || "a4e8f1b2-9c3d-4a7f-8b1e-6f2c3d4a5b6c-internal"
+                    "X-API-Key": internalApiKey
                 }
             }
         );
@@ -107,14 +104,11 @@ async function mainCycle() {
 
         const apiData = await response.json();
 
-        // ADDED: Flexible handling of the response data structure.
         let recentGames = [];
-        if (apiData && apiData.data && Array.isArray(apiData.data.list)) { // Handles { data: { list: [...] } }
-             recentGames = apiData.data.list;
-        } else if (apiData && Array.isArray(apiData)) { // Handles [...]
-             recentGames = apiData;
-        } else if (apiData && apiData.history && Array.isArray(apiData.history)) { // Handles { history: [...] }
+        if (apiData && Array.isArray(apiData.history)) {
              recentGames = apiData.history;
+        } else if (apiData && Array.isArray(apiData)) {
+             recentGames = apiData;
         }
 
         if (recentGames.length > 0) {
@@ -128,7 +122,7 @@ async function mainCycle() {
             const gameDataStore = fs.existsSync(GAME_DATA_PATH) ? JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8')) : { history: [] };
             if (!gameDataStore.history.some(h => String(h.issueNumber) === String(latestGameResult.issueNumber))) {
                 gameDataStore.history.unshift(latestGameResult);
-                gameDataStore.history = gameDataStore.history.slice(0, 5000); // Keep history to a reasonable size
+                gameDataStore.history = gameDataStore.history.slice(0, 5000);
                 fs.writeFileSync(GAME_DATA_PATH, JSON.stringify(gameDataStore, null, 2));
                 console.log(`Stored new game result for period ${latestGameResult.issueNumber}`);
             }
@@ -136,12 +130,10 @@ async function mainCycle() {
             if (String(latestGameResult.issueNumber) !== appState.lastProcessedPeriodId) {
                 console.log(`New period detected. Old: ${appState.lastProcessedPeriodId}, New: ${latestGameResult.issueNumber}. Running prediction cycle.`);
 
-                // UPDATED: Calling the new prediction logic.
                 const historyForPrediction = gameDataStore.history;
                 const predictionResult = await ultraAIPredict(historyForPrediction, appState.predictionState);
 
-                // The predictionResult contains the new prediction and the state for the next run.
-                appState.predictionState = predictionResult; // Save the entire state for the next cycle
+                appState.predictionState = predictionResult;
                 appState.lastProcessedPeriodId = String(latestGameResult.issueNumber);
                 appState.nextPrediction = {
                     prediction: predictionResult.finalDecision,
@@ -209,6 +201,21 @@ app.get('/game-data', requireApiKey, (req, res) => {
         res.status(404).json({ history: [] });
     }
 });
+
+// NEW: Added this endpoint to provide the data collection status to the UI
+app.get('/status', requireApiKey, (req, res) => {
+    let count = 0;
+    if (fs.existsSync(GAME_DATA_PATH)) {
+        try {
+            const gameDataStore = JSON.parse(fs.readFileSync(GAME_DATA_PATH, 'utf8'));
+            count = gameDataStore.history.length;
+        } catch (error) {
+            console.error("Error reading game data for status:", error);
+        }
+    }
+    res.json({ collectedDataCount: count });
+});
+
 
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
